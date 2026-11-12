@@ -1,0 +1,50 @@
+module MerkleMachines
+  VERSION: String
+  PENDING_CAPACITY: Integer
+  OUTPUT_CAPACITY: Integer
+  MAX_FANOUT: Integer
+
+  type refusal = :fanout_mismatch | :depth_mismatch | :partitioning_mismatch | :digest_mismatch
+               | :invalid_schema | :undersized | :busy | :exhausted
+               | :stale | :unexpected | :version_changed | :arity | :inconsistent | :refused
+
+  class Schema < Data
+    attr_reader fanout: Integer
+    attr_reader depth: Integer
+    attr_reader partitioning: Integer
+    attr_reader digest: Integer
+    def self.new: (Integer fanout, Integer depth, Integer partitioning, Integer digest) -> Schema
+                | (fanout: Integer, depth: Integer, partitioning: Integer, digest: Integer) -> Schema
+  end
+
+  class Versions < Data
+    attr_reader local: Integer
+    attr_reader remote: Integer
+    def self.new: (Integer local, Integer remote) -> Versions
+                | (local: Integer, remote: Integer) -> Versions
+  end
+
+  class Request < Data
+    attr_reader session: Integer
+    attr_reader level: Integer
+    attr_reader index: Integer
+    def self.new: (Integer session, Integer level, Integer index) -> Request
+                | (session: Integer, level: Integer, index: Integer) -> Request
+  end
+
+  class Survey
+    def self.new: () -> Survey
+    def begin: (Schema local, Schema remote, Versions versions, String local_root, String remote_root) -> (:identical | :diverged | refusal)
+    def next_request: () -> Request?
+    def answer: (Request request, Versions versions, Array[String] local_children, Array[String] remote_children) -> (:accepted | refusal)
+    def requeue: (Request request) -> bool
+    def requeue_all: () -> Integer
+    def take_ranges: (?Integer limit) -> Array[Range[Integer]]
+    def abort: () -> bool
+    def phase: () -> (:idle | :surveying | :draining | :complete)
+    def session: () -> Integer
+    def pending: () -> Integer
+    def in_flight: () -> Integer
+    def buffered: () -> Integer
+  end
+end
