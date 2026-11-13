@@ -1,5 +1,16 @@
 # Changelog
 
+## [0.2.0](https://github.com/seuros/merkle_machines/compare/merkle_machines/v0.1.2...merkle_machines/v0.2.0) (2026-11-13)
+
+
+### ⚠ BREAKING CHANGES
+
+* see CONVENTIONS: one exhaustive Refusal per crate, Result from every mutator, honoured idempotent repeats, Ruby mirrors the core. No compatibility aliases. requeue returns Result<(), Refusal>; abort returns Aborting; Schema.new raises where the core has no schema.
+
+### Features
+
+* requeue and abort answer their real outcome, Ruby Request carries a Node and drain replaces take_ranges ([445d667](https://github.com/seuros/merkle_machines/commit/445d667f19c51a2bbf225af73d2897420a9a4d9a))
+
 ## [0.1.2](https://github.com/seuros/merkle_machines/compare/merkle_machines/v0.1.1...merkle_machines/v0.1.2) (2026-11-13)
 
 
