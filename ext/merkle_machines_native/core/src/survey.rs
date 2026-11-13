@@ -1,5 +1,7 @@
 //! The bounded, resumable comparison traversal.
 
+use periscope_machines::{Issuer, scope_of, scoped};
+
 use crate::{
     refusal::Refusal,
     schema::{LeafRange, Node, Schema},
@@ -29,10 +31,17 @@ impl Request {
         Self { session, node }
     }
 
-    /// Session the request belongs to.
+    /// Session the request belongs to: a scoped id, the issuing survey's
+    /// scope in the top 16 bits and its session count (from one) below.
     #[must_use]
     pub const fn session(&self) -> u64 {
         self.session
+    }
+
+    /// The scope of the survey that issued the request's session.
+    #[must_use]
+    pub const fn scope(&self) -> u16 {
+        scope_of(self.session)
     }
 
     /// Node whose children are wanted.
@@ -102,7 +111,8 @@ const EMPTY: LeafRange = LeafRange { start: 0, end: 0 };
 pub struct Survey<const P: usize, const O: usize> {
     schema: Option<Schema>,
     versions: Versions,
-    pub(crate) session: u64,
+    /// Issues session ids; the latest one is the open (or last) session.
+    issuer: Issuer,
     slots: [Slot; P],
     out: [LeafRange; O],
     buffered: usize,
@@ -115,16 +125,52 @@ impl<const P: usize, const O: usize> Default for Survey<P, O> {
 }
 
 impl<const P: usize, const O: usize> Survey<P, O> {
-    /// An idle survey.
+    /// An idle survey in scope zero.
     #[must_use]
     pub const fn new() -> Self {
+        Self::with_scope(0)
+    }
+
+    /// An idle survey whose sessions, and so its requests, carry `scope`.
+    ///
+    /// Requests are only meaningful to the survey that issued them. Two
+    /// surveys in the same scope issue the same session ids, so give every
+    /// survey whose requests could meet its own scope.
+    #[must_use]
+    pub const fn with_scope(scope: u16) -> Self {
+        Self::build(Issuer::new(scope))
+    }
+
+    /// An idle survey that continues `scope` after a restart: `issued` is
+    /// what [`issued`](Self::issued) answered when the caller saved it.
+    ///
+    /// Only the session sequence is restored. No session is open and nothing
+    /// is queued or buffered: every request issued before the restart is
+    /// [`Refusal::Stale`], and comparing again is the caller's job.
+    /// [`session`](Self::session) names the last session issued before the
+    /// restart, which is not open. The next session carries sequence
+    /// `issued + 1`, so none is reissued as long as the saved count is not
+    /// lower than what the survey had really issued; save it before sending a
+    /// request out.
+    ///
+    /// `None` when `issued` is beyond `periscope_machines::SEQUENCE_MAX`,
+    /// which no survey reaches.
+    #[must_use]
+    pub const fn resumed(scope: u16, issued: u64) -> Option<Self> {
+        match Issuer::resumed(scope, issued) {
+            Some(sequence) => Some(Self::build(sequence)),
+            None => None,
+        }
+    }
+
+    const fn build(issuer: Issuer) -> Self {
         Self {
             schema: None,
             versions: Versions {
                 local: 0,
                 remote: 0,
             },
-            session: 0,
+            issuer,
             slots: [FREE; P],
             out: [EMPTY; O],
             buffered: 0,
@@ -152,8 +198,11 @@ impl<const P: usize, const O: usize> Survey<P, O> {
         if O == 0 || P < usize::from(local.depth()) {
             return Err(Refusal::Undersized);
         }
-        let session = self.session.checked_add(1).ok_or(Refusal::Exhausted)?;
-        self.session = session;
+        // Last check: a session id is only spent on a session that opens.
+        match self.issuer.issue() {
+            Ok(_) => {}
+            Err(periscope_machines::Refusal::Exhausted) => return Err(Refusal::Exhausted),
+        }
         self.schema = Some(local);
         self.versions = versions;
         if local_root == remote_root {
@@ -190,13 +239,14 @@ impl<const P: usize, const O: usize> Survey<P, O> {
         }
         let i = best?;
         self.slots[i].state = State::InFlight;
-        Some(Request::new(self.session, self.slots[i].node))
+        Some(Request::new(self.session(), self.slots[i].node))
     }
 
     /// Supply both trees' child digests for an in-flight node, in child order.
     ///
     /// # Errors
-    /// [`Refusal::Stale`], [`Refusal::Unexpected`], [`Refusal::VersionChanged`],
+    /// [`Refusal::Stale`] (a request of another session or another survey's
+    /// scope), [`Refusal::Unexpected`], [`Refusal::VersionChanged`],
     /// [`Refusal::Arity`] or [`Refusal::Inconsistent`]; the survey is unchanged
     /// and the node stays in flight.
     pub fn answer<D: PartialEq>(
@@ -234,9 +284,9 @@ impl<const P: usize, const O: usize> Survey<P, O> {
     /// Put an in-flight node back in the queue, for a request that was lost.
     ///
     /// # Errors
-    /// [`Refusal::Stale`] when the request belongs to another session or no
-    /// session is open, [`Refusal::Unexpected`] when the node is not in flight;
-    /// the survey is unchanged.
+    /// [`Refusal::Stale`] when the request belongs to another session or
+    /// another survey's scope, or no session is open; [`Refusal::Unexpected`]
+    /// when the node is not in flight; the survey is unchanged.
     pub fn requeue(&mut self, request: Request) -> Result<(), Refusal> {
         self.live(request).ok_or(Refusal::Stale)?;
         let slot = self
@@ -308,10 +358,27 @@ impl<const P: usize, const O: usize> Survey<P, O> {
         }
     }
 
-    /// Counter of the latest session; requests carry it.
+    /// Id of the latest session; requests carry it. Zero, which is never
+    /// issued, until the first session begins.
     #[must_use]
     pub const fn session(&self) -> u64 {
-        self.session
+        match self.issuer.issued() {
+            0 => 0,
+            sequence => scoped(self.issuer.scope(), sequence),
+        }
+    }
+
+    /// Sessions issued in this scope so far, the open one included: the count
+    /// to save for [`resumed`](Self::resumed).
+    #[must_use]
+    pub const fn issued(&self) -> u64 {
+        self.issuer.issued()
+    }
+
+    /// The scope carried by every session, and so every request, of this survey.
+    #[must_use]
+    pub const fn scope(&self) -> u16 {
+        self.issuer.scope()
     }
 
     /// Schema of the open session.
@@ -348,8 +415,13 @@ impl<const P: usize, const O: usize> Survey<P, O> {
         self.buffered
     }
 
+    /// Origin first: a request whose session this survey's issuer never
+    /// handed out names nothing here, whatever node it carries.
     fn live(&self, request: Request) -> Option<Schema> {
-        self.schema.filter(|_| request.session == self.session)
+        if !self.issuer.owns(request.session) {
+            return None;
+        }
+        self.schema.filter(|_| request.session == self.session())
     }
 
     fn position(&self, node: Node, state: State) -> Option<usize> {

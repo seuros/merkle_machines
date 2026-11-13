@@ -17,9 +17,10 @@ pub enum Refusal {
     Undersized,
     /// A session is still surveying or draining; abort it first.
     Busy,
-    /// The session counter is spent.
+    /// Every session id of this survey's scope has been issued.
     Exhausted,
-    /// The request belongs to another session, or no session is open.
+    /// The request does not belong to the open session: it is from an earlier
+    /// session, from another survey's scope, or no session is open.
     Stale,
     /// The node is not in flight: never requested, already answered or requeued.
     Unexpected,
@@ -40,7 +41,7 @@ impl fmt::Display for Refusal {
             Self::Schema(Mismatch::Digest) => "the trees differ in digest",
             Self::Undersized => "capacity is below what the tree needs",
             Self::Busy => "a session is still open",
-            Self::Exhausted => "session counter exhausted",
+            Self::Exhausted => "every session of this scope has been issued",
             Self::Stale => "request does not belong to the open session",
             Self::Unexpected => "node is not in flight",
             Self::VersionChanged => "digests were read from another tree version",

@@ -42,7 +42,7 @@ fn capacity_and_session_refusals_leave_the_survey_untouched() {
     assert_eq!(survey.abort(), Aborting::AlreadyIdle);
     assert_eq!(survey.phase(), Phase::Idle);
 
-    survey.session = u64::MAX;
+    let mut survey = must(Survey::<5, 1>::resumed(0, SEQUENCE_MAX));
     let frozen = survey;
     assert_eq!(survey.begin(deep, deep, V, &1, &2), Err(Refusal::Exhausted));
     assert_eq!(survey, frozen);

@@ -42,6 +42,16 @@ impl TryConvert for Small {
     }
 }
 
+/// An issuer scope: an Integer in `0..=65535`.
+#[derive(Clone, Copy)]
+struct Scope(u16);
+
+impl TryConvert for Scope {
+    fn try_convert(value: Value) -> Result<Self, Error> {
+        u16::try_convert(integer(value)?).map(Self)
+    }
+}
+
 /// A caller-supplied digest: a Ruby String compared byte for byte.
 #[derive(Clone, Copy)]
 struct Digest(RString);
@@ -169,6 +179,12 @@ const fn request(ticket: Ticket) -> Request {
     )
 }
 
+/// `Request#scope`: the core's `Request::scope`, so the id layout stays the
+/// core's business.
+const fn request_scope(session: Number) -> u16 {
+    Request::new(session.0, Node::ROOT).scope()
+}
+
 #[magnus::wrap(class = "MerkleMachines::Survey", free_immediately, size)]
 struct Survey {
     core: RefCell<merkle_machines::Survey<PENDING_CAPACITY, OUTPUT_CAPACITY>>,
@@ -179,6 +195,32 @@ impl Survey {
         Self {
             core: RefCell::new(merkle_machines::Survey::new()),
         }
+    }
+
+    const fn with_scope(scope: Scope) -> Self {
+        Self {
+            core: RefCell::new(merkle_machines::Survey::with_scope(scope.0)),
+        }
+    }
+
+    fn resumed(ruby: &Ruby, scope: Scope, issued: Number) -> Result<Self, Error> {
+        let core = merkle_machines::Survey::resumed(scope.0, issued.0).ok_or_else(|| {
+            Error::new(
+                ruby.exception_range_error(),
+                "issued is past the last sequence of a scope (2**48 - 1)",
+            )
+        })?;
+        Ok(Self {
+            core: RefCell::new(core),
+        })
+    }
+
+    fn scope(&self) -> u16 {
+        self.core.borrow().scope()
+    }
+
+    fn issued(&self) -> u64 {
+        self.core.borrow().issued()
     }
 
     fn begin(

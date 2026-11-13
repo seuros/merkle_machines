@@ -52,22 +52,39 @@ module MerkleMachines
                 | (level: Integer, index: Integer) -> Node
   end
 
-  # Mirrors the core's `Request`.
+  # Mirrors the core's `Request`. `session` is a scoped id: the issuing
+  # survey's scope in the top 16 bits, its session count (from one) below.
   class Request < Data
     attr_reader session: Integer
     attr_reader node: Node
     def self.new: (Integer session, Node node) -> Request
                 | (session: Integer, node: Node) -> Request
+    # The scope of the survey that issued the session, 0..65535. TypeError
+    # for a non-Integer session, RangeError outside 0..2**64-1.
+    def scope: () -> Integer
   end
 
   class Survey
+    # Scope zero.
     def self.new: () -> Survey
+    # `scope` is an Integer in 0..65535: TypeError otherwise, RangeError
+    # outside the range.
+    def self.with_scope: (Integer scope) -> Survey
+    # Continues `scope` after a restart from a saved `issued` count. Restores
+    # only the session sequence: the survey is idle. RangeError when `issued`
+    # is above 2**48 - 1.
+    def self.resumed: (Integer scope, Integer issued) -> Survey
+    # The scope carried by every session, and so every Request, of this survey.
+    def scope: () -> Integer
+    # Sessions issued in this scope so far: the count to save for `resumed`.
+    def issued: () -> Integer
     # Honoured: :identical, :diverged. Refused: begin_refusal.
     def begin: (Schema local, Schema remote, Versions versions, String local_root, String remote_root) -> (:identical | :diverged | begin_refusal)
     # The next node whose child digests are wanted, nil when nothing is queued.
     # Never refuses.
     def next_request: () -> Request?
-    # Honoured: :accepted. Refused: answer_refusal.
+    # Honoured: :accepted. Refused: answer_refusal; :stale covers a Request
+    # from an earlier session or from a survey in another scope.
     def answer: (Request request, Versions versions, Array[String] local, Array[String] remote) -> (:accepted | answer_refusal)
     # Honoured: :requeued. Refused: requeue_refusal.
     def requeue: (Request request) -> (:requeued | requeue_refusal)
@@ -82,6 +99,7 @@ module MerkleMachines
     # :already_idle when none was open (nothing changes). Never refuses.
     def abort: () -> (:aborted | :already_idle)
     def phase: () -> (:idle | :surveying | :draining | :complete)
+    # The id of the latest session; 0 until the first one begins.
     def session: () -> Integer
     # The schema of the open session, nil when the survey is idle.
     def schema: () -> Schema?

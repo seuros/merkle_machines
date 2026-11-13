@@ -178,6 +178,95 @@ class SurveyTest < Minitest::Test
     assert_equal :stale, survey.answer(request, PINS, %w[a b], %w[a c])
   end
 
+  # Two surveys, the same calls: a request from one named a node in flight on
+  # the other. In different scopes each refuses the other's.
+  def test_request_from_another_scope_is_refused_and_changes_nothing
+    shape = schema(fanout: 2, depth: 2)
+    a = Survey.with_scope(1)
+    b = Survey.with_scope(2)
+    [a, b].each { |survey| assert_equal :diverged, survey.begin(shape, shape, PINS, 'a', 'b') }
+    from_a = a.next_request
+    from_b = b.next_request
+    assert_equal [1, 2, 1, 2], [a.scope, b.scope, from_a.scope, from_b.scope]
+    assert_equal [(1 << 48) | 1, (2 << 48) | 1, from_a.node], [from_a.session, from_b.session, from_b.node]
+    assert_equal [from_a.session, from_b.session], [a.session, b.session]
+    snapshot = ->(survey) { [survey.phase, survey.session, survey.pending, survey.in_flight, survey.buffered] }
+    before = [snapshot.(a), snapshot.(b)]
+    assert_equal :stale, b.answer(from_a, PINS, %w[a b], %w[a c])
+    assert_equal :stale, b.requeue(from_a)
+    assert_equal :stale, a.answer(from_b, PINS, %w[a b], %w[a c])
+    assert_equal :stale, a.requeue(from_b)
+    assert_equal before, [snapshot.(a), snapshot.(b)]
+    assert_equal :accepted, a.answer(from_a, PINS, %w[a b], %w[a c])
+    assert_equal :requeued, b.requeue(from_b)
+  end
+
+  # The core cannot pick a scope: two surveys left in scope zero issue the same
+  # sessions, and one honours the other's request.
+  def test_surveys_left_in_the_same_scope_still_alias
+    a = started
+    b = started
+    request = a.next_request
+    assert_equal request, b.next_request
+    assert_equal [0, 0, 0, 1], [a.scope, b.scope, request.scope, request.session]
+    assert_equal :accepted, b.answer(request, PINS, %w[a b], %w[a c])
+  end
+
+  def test_with_scope_takes_an_integer_scope
+    survey = Survey.with_scope(65_535)
+    assert_equal [65_535, 0, 0, :idle], [survey.scope, survey.session, survey.issued, survey.phase]
+    assert_equal [0, 0], [Survey.new.scope, Survey.with_scope(0).scope]
+    [1.0, nil, '1', Object.new].each { |value| assert_raises(TypeError) { Survey.with_scope(value) } }
+    [-1, 65_536, 2**64].each { |scope| assert_raises(RangeError) { Survey.with_scope(scope) } }
+    assert_equal 65_535, Request.new((65_535 << 48) | 9, Node::ROOT).scope
+    assert_raises(TypeError) { Request.new('1', Node::ROOT).scope }
+    assert_raises(RangeError) { Request.new(2**64, Node::ROOT).scope }
+  end
+
+  # A fresh survey opens session 1 again, so a request that outlived a restart
+  # would name a node in flight there. A resumed one continues the scope.
+  def test_resumed_survey_continues_its_scope_and_refuses_earlier_requests
+    shape = schema(fanout: 2, depth: 2)
+    first = Survey.with_scope(5)
+    earlier = 2.times.map do
+      first.abort
+      assert_equal :diverged, first.begin(shape, shape, PINS, 'a', 'b')
+      first.next_request
+    end
+    assert_equal [2, (5 << 48) | 2], [first.issued, first.session]
+
+    survey = Survey.resumed(first.scope, first.issued)
+    assert_equal [5, 2, :idle, nil, 0], [survey.scope, survey.issued, survey.phase, survey.schema, survey.pending]
+    refused = -> { earlier.flat_map { |old| [survey.answer(old, PINS, %w[a b], %w[a c]), survey.requeue(old)] } }
+    assert_equal [:stale] * 4, refused.()
+    assert_equal :diverged, survey.begin(shape, shape, PINS, 'a', 'b')
+    request = survey.next_request
+    assert_equal [(5 << 48) | 3, 3, earlier.last.node], [request.session, survey.issued, request.node]
+    assert_equal [:stale] * 4, refused.()
+    assert_equal [1, 1], [survey.pending, survey.in_flight]
+    assert_equal :accepted, survey.answer(request, PINS, %w[a b], %w[a c])
+  end
+
+  def test_resumed_at_the_last_sequence_is_spent_and_past_it_raises
+    shape = schema(fanout: 2, depth: 2)
+    last = (2**48) - 1
+    survey = Survey.resumed(3, last - 1)
+    assert_equal :diverged, survey.begin(shape, shape, PINS, 'a', 'b')
+    assert_equal [(3 << 48) | last, last], [survey.session, survey.issued]
+    assert_equal :busy, survey.begin(shape, shape, PINS, 'a', 'b')
+    assert_equal :aborted, survey.abort
+    assert_equal :exhausted, survey.begin(shape, shape, PINS, 'a', 'b')
+    spent = Survey.resumed(3, last)
+    assert_equal [:exhausted, :idle, last], [spent.begin(shape, shape, PINS, 'a', 'b'), spent.phase, spent.issued]
+    assert_raises(RangeError) { Survey.resumed(3, last + 1) }
+    [-1, 65_536].each { |scope| assert_raises(RangeError) { Survey.resumed(scope, 0) } }
+    assert_raises(RangeError) { Survey.resumed(3, -1) }
+    [1.0, nil, '1'].each do |value|
+      assert_raises(TypeError) { Survey.resumed(value, 0) }
+      assert_raises(TypeError) { Survey.resumed(3, value) }
+    end
+  end
+
   def test_answer_refusals_change_nothing
     survey = started
     request = survey.next_request

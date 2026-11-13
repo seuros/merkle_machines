@@ -10,5 +10,8 @@ exclude = ["src/**/tests.rs", "tests/"]
 keywords = ["merkle", "anti-entropy", "reconciliation", "digest", "no-std"]
 categories = ["no-std", "algorithms"]
 
+[dependencies]
+periscope-machines.workspace = true
+
 [lints]
 workspace = true

@@ -1,7 +1,8 @@
 # frozen_string_literal: true
 
 module MerkleMachines
-  private_class_method :check_schema, :schema_leaves, :schema_width, :schema_span, :schema_compatible
+  private_class_method :check_schema, :schema_leaves, :schema_width, :schema_span, :schema_compatible,
+                       :request_scope
 
   # Reads a value object's fields, refusing anything that is not one.
   def self.fields(value, type)
@@ -49,8 +50,13 @@ module MerkleMachines
   # Tree versions every digest of one session must be read from.
   Versions = Data.define(:local, :remote)
 
-  # A request for the child digests of one node, on both trees.
-  Request = Data.define(:session, :node)
+  # A request for the child digests of one node, on both trees. `session` is
+  # the scoped id of the session it belongs to; only the survey that issued it
+  # honours the request.
+  Request = Data.define(:session, :node) do
+    # The scope of the survey that issued the request's session.
+    def scope = MerkleMachines.__send__(:request_scope, session)
+  end
 
   # Value objects around the native survey. The traversal itself is native.
   class Survey

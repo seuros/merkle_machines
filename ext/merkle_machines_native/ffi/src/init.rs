@@ -1,7 +1,7 @@
 //! Private native entry point.
 use crate::{
-    MAX_FANOUT, OUTPUT_CAPACITY, PENDING_CAPACITY, Survey, check_schema, schema_compatible,
-    schema_leaves, schema_span, schema_width,
+    MAX_FANOUT, OUTPUT_CAPACITY, PENDING_CAPACITY, Survey, check_schema, request_scope,
+    schema_compatible, schema_leaves, schema_span, schema_width,
 };
 use magnus::{Error, Ruby, function, method, prelude::*};
 
@@ -16,9 +16,14 @@ fn init(ruby: &Ruby) -> Result<(), Error> {
     module.define_singleton_method("schema_width", function!(schema_width, 2))?;
     module.define_singleton_method("schema_span", function!(schema_span, 2))?;
     module.define_singleton_method("schema_compatible", function!(schema_compatible, 2))?;
+    module.define_singleton_method("request_scope", function!(request_scope, 1))?;
     let class = module.define_class("Survey", ruby.class_object())?;
     class.undef_default_alloc_func();
     class.define_singleton_method("new", function!(Survey::new, 0))?;
+    class.define_singleton_method("with_scope", function!(Survey::with_scope, 1))?;
+    class.define_singleton_method("resumed", function!(Survey::resumed, 2))?;
+    class.define_method("scope", method!(Survey::scope, 0))?;
+    class.define_method("issued", method!(Survey::issued, 0))?;
     class.define_private_method("native_begin", method!(Survey::begin, 5))?;
     class.define_private_method("native_next_request", method!(Survey::next_request, 0))?;
     class.define_private_method("native_answer", method!(Survey::answer, 4))?;

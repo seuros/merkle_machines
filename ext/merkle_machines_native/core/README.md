@@ -27,9 +27,28 @@ traversal instead of losing work. Lost requests are requeued one by one or all
 at once. Every refusal is a `Refusal`, the crate's one refusal type, and leaves
 the survey unchanged: `begin`, `answer` and `requeue` return
 `Result<_, Refusal>`. Requests carry a session
-counter, so answers to an aborted or replaced session are stale. `abort` never
+id, so answers to an aborted or replaced session are stale. `abort` never
 refuses: it answers `Aborting::Aborted`, or `Aborting::AlreadyIdle` when no
 session was open, an idempotent repeat that changes nothing.
+
+**Scopes.** A request is only meaningful to the survey that issued it. Session
+ids come from a `periscope_machines::Issuer`: the survey's scope in the top 16
+bits, a sequence counted from one below, never reissued.
+`Survey::with_scope(scope)` chooses the scope and `new()` is scope zero;
+`Survey::scope` and `Request::scope` read it. `answer` and `requeue` answer
+`Stale` for a request whose session the survey did not issue, before looking at
+any node. Give each survey its own scope: the core reads no clock and no random
+source, so it cannot pick one, and two surveys left in the same scope issue the
+same sessions. A scope is `Exhausted` after 2^48 - 1 sessions. `session()` is
+zero, the id no issuer hands out, until the first session begins.
+
+**Restarts.** A fresh survey opens session one again, so a request that
+outlived a restart could name a node in flight in a new session. Save
+`Survey::issued` and rebuild with `Survey::resumed(scope, issued)`, or give
+each incarnation a new scope. `resumed` restores only the session sequence: the
+survey is idle, every earlier request is `Stale`, and comparing again is the
+caller's job. It is `None` when `issued` is beyond
+`periscope_machines::SEQUENCE_MAX`.
 
 The Ruby gem mirrors `Schema`, `Versions`, `Node` and `Request` as `Data`
 values of the same names and fields. Where `Schema::new` answers `None`, its
@@ -66,4 +85,16 @@ while let Some(request) = survey.next_request() {
 }
 assert_eq!(survey.pop_range(), Some(LeafRange { start: 2, end: 3 }));
 assert_eq!(survey.phase(), Phase::Complete);
+
+// Another survey, another scope: it refuses a request it did not issue.
+use merkle_machines::Refusal;
+let mut north = Survey::<4, 4>::with_scope(1);
+let mut south = Survey::<4, 4>::with_scope(2);
+north.begin(schema, schema, versions, &100_u64, &101_u64).expect("comparable");
+south.begin(schema, schema, versions, &100_u64, &101_u64).expect("comparable");
+let request = north.next_request().expect("the root");
+south.next_request().expect("the root");
+assert_eq!(request.scope(), 1);
+assert_eq!(south.answer(request, versions, &ours[0], &theirs[0]), Err(Refusal::Stale));
+assert_eq!(north.answer(request, versions, &ours[0], &theirs[0]), Ok(()));
 ```

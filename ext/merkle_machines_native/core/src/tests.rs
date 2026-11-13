@@ -1,5 +1,8 @@
 mod buffer;
 mod refusal;
+mod scope;
+
+use periscope_machines::{SEQUENCE_MAX, scoped, sequence_of};
 
 use super::*;
 
@@ -87,14 +90,34 @@ fn reply<const P: usize, const O: usize>(
     survey.answer(request, V, &a[..n], &b[..n])
 }
 
+/// The same node and session number as `request`, from another survey's scope.
+fn foreign(request: Request) -> Request {
+    let scope = request.scope().wrapping_add(1);
+    Request::new(
+        scoped(scope, sequence_of(request.session())),
+        request.node(),
+    )
+}
+
+/// An in-flight request from another scope is refused and changes nothing.
+fn refuse_foreign<const P: usize, const O: usize>(survey: &mut Survey<P, O>, request: Request) {
+    let frozen = *survey;
+    assert_eq!(survey.requeue(foreign(request)), Err(Refusal::Stale));
+    let stale = survey.answer(foreign(request), V, &[1, 2], &[1, 3]);
+    assert_eq!(stale, Err(Refusal::Stale));
+    assert_eq!(*survey, frozen);
+}
+
 /// Requeue an in-flight request, then prove a repeat and a request from
 /// another session are refused by name and change nothing.
 fn requeue_once<const P: usize, const O: usize>(survey: &mut Survey<P, O>, request: Request) {
+    refuse_foreign(survey, request);
     assert_eq!(survey.requeue(request), Ok(()));
     let frozen = *survey;
     assert_eq!(survey.requeue(request), Err(Refusal::Unexpected));
     let other = Request::new(request.session() + 1, request.node());
     assert_eq!(survey.requeue(other), Err(Refusal::Stale));
+    assert_eq!(survey.requeue(foreign(request)), Err(Refusal::Stale));
     assert_eq!(*survey, frozen);
 }
 
@@ -127,7 +150,9 @@ fn run<const P: usize, const O: usize>(rng: &mut Rng, fanout: u8, depth: u8) {
         }
     }
 
-    let mut survey = Survey::<P, O>::new();
+    // Scope zero, and non-zero scopes up to the last one.
+    let scope = [0, 0x4236, u16::MAX][at(rng.below(3))];
+    let mut survey = Survey::<P, O>::with_scope(scope);
     let roots = (ours.digest(Node::ROOT), theirs.digest(Node::ROOT));
     let begun = survey.begin(shape, shape, V, &roots.0, &roots.1);
     let same = ours.leaves == theirs.leaves;
@@ -157,6 +182,8 @@ fn run<const P: usize, const O: usize>(rng: &mut Rng, fanout: u8, depth: u8) {
             3..=5 => {
                 let pick = at(rng.below(64));
                 if let Some(request) = flying[pick..].iter_mut().find_map(Option::take) {
+                    assert_eq!(request.scope(), scope);
+                    refuse_foreign(&mut survey, request);
                     let frozen = survey;
                     assert_eq!(reply(&mut survey, request, &ours, &theirs), Ok(()));
                     assert_ne!(survey, frozen);
