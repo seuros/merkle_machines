@@ -1,5 +1,16 @@
 # Changelog
 
+## [0.3.0](https://github.com/seuros/merkle_machines/compare/merkle_machines/v0.2.0...merkle_machines/v0.3.0) (2026-11-13)
+
+
+### ⚠ BREAKING CHANGES
+
+* handles are issued through periscope-machines. Every instance can be built with a scope; a handle from another scope is refused before any lookup; all handle kinds of an instance share one sequence; resumed restores the sequence after a restart. A request from another survey answers Stale.
+
+### Features
+
+* scope sessions through periscope-machines, add Survey::resumed and issued ([0e54402](https://github.com/seuros/merkle_machines/commit/0e54402d670ce201fe4d18cf61544276005b87be))
+
 ## [0.2.0](https://github.com/seuros/merkle_machines/compare/merkle_machines/v0.1.2...merkle_machines/v0.2.0) (2026-11-13)
 
 
