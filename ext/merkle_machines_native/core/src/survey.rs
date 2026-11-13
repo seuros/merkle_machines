@@ -1,6 +1,9 @@
 //! The bounded, resumable comparison traversal.
 
-use crate::schema::{LeafRange, Mismatch, Node, Schema};
+use crate::{
+    refusal::Refusal,
+    schema::{LeafRange, Node, Schema},
+};
 
 /// Tree versions the digests of one session must all be read from.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -61,28 +64,13 @@ pub enum Phase {
     Complete,
 }
 
-/// Why a call was refused. A refused call changes nothing.
+/// What [`Survey::abort`] did. Both are honoured; neither is a refusal.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[non_exhaustive]
-pub enum Refusal {
-    /// The two trees are not comparable.
-    Schema(Mismatch),
-    /// Pending capacity is below the tree depth, or output capacity is zero.
-    Undersized,
-    /// A session is still surveying or draining; abort it first.
-    Busy,
-    /// The session counter is spent.
-    Exhausted,
-    /// The request belongs to another session, or no session is open.
-    Stale,
-    /// The node is not in flight: never requested, already answered or requeued.
-    Unexpected,
-    /// The digests were read from a different tree version than the session pinned.
-    VersionChanged,
-    /// A child digest list does not hold exactly `fanout` digests.
-    Arity,
-    /// The parents differed but no child does: the digests are not from one tree.
-    Inconsistent,
+pub enum Aborting {
+    /// A session was open and it was dropped.
+    Aborted,
+    /// No session was open: an idempotent repeat that changed nothing.
+    AlreadyIdle,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -244,16 +232,18 @@ impl<const P: usize, const O: usize> Survey<P, O> {
     }
 
     /// Put an in-flight node back in the queue, for a request that was lost.
-    /// `false` when the request is stale or the node is not in flight.
-    pub fn requeue(&mut self, request: Request) -> bool {
-        if self.live(request).is_none() {
-            return false;
-        }
-        let Some(slot) = self.position(request.node, State::InFlight) else {
-            return false;
-        };
+    ///
+    /// # Errors
+    /// [`Refusal::Stale`] when the request belongs to another session or no
+    /// session is open, [`Refusal::Unexpected`] when the node is not in flight;
+    /// the survey is unchanged.
+    pub fn requeue(&mut self, request: Request) -> Result<(), Refusal> {
+        self.live(request).ok_or(Refusal::Stale)?;
+        let slot = self
+            .position(request.node, State::InFlight)
+            .ok_or(Refusal::Unexpected)?;
         self.slots[slot].state = State::Queued;
-        true
+        Ok(())
     }
 
     /// Put every in-flight node back in the queue, for a dropped connection.
@@ -292,15 +282,16 @@ impl<const P: usize, const O: usize> Survey<P, O> {
     }
 
     /// Drop the session. Outstanding requests become stale and buffered ranges
-    /// are discarded. `false` when no session was open.
-    pub const fn abort(&mut self) -> bool {
+    /// are discarded. Never refuses: [`Aborting::AlreadyIdle`] when no session
+    /// was open, which is the effect asked for already holding, and nothing changed.
+    pub const fn abort(&mut self) -> Aborting {
         if self.schema.is_none() {
-            return false;
+            return Aborting::AlreadyIdle;
         }
         self.schema = None;
         self.slots = [FREE; P];
         self.buffered = 0;
-        true
+        Aborting::Aborted
     }
 
     /// Where the survey stands.

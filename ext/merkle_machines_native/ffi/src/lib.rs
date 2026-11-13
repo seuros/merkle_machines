@@ -7,7 +7,7 @@ use magnus::{
     Error, Integer, RArray, RString, Ruby, Symbol, TryConvert, Value, prelude::*, typed_data::Obj,
 };
 use merkle_machines::{
-    Begun, LeafRange, Mismatch, Node, Phase, Refusal, Request, Schema, Versions,
+    Aborting, Begun, LeafRange, Mismatch, Node, Phase, Refusal, Request, Schema, Versions,
 };
 
 const PENDING_CAPACITY: usize = 64;
@@ -73,12 +73,19 @@ fn digests(list: Value) -> Result<Vec<Digest>, Error> {
     list.into_iter().map(Digest::try_convert).collect()
 }
 
+/// One symbol per `Mismatch`, shared by `Schema#compatible` and `Survey#begin`.
+const fn mismatch(mismatch: Mismatch) -> &'static str {
+    match mismatch {
+        Mismatch::Fanout => "fanout_mismatch",
+        Mismatch::Depth => "depth_mismatch",
+        Mismatch::Partitioning => "partitioning_mismatch",
+        Mismatch::Digest => "digest_mismatch",
+    }
+}
+
 const fn refusal(refusal: Refusal) -> &'static str {
     match refusal {
-        Refusal::Schema(Mismatch::Fanout) => "fanout_mismatch",
-        Refusal::Schema(Mismatch::Depth) => "depth_mismatch",
-        Refusal::Schema(Mismatch::Partitioning) => "partitioning_mismatch",
-        Refusal::Schema(Mismatch::Digest) => "digest_mismatch",
+        Refusal::Schema(reason) => mismatch(reason),
         Refusal::Undersized => "undersized",
         Refusal::Busy => "busy",
         Refusal::Exhausted => "exhausted",
@@ -87,11 +94,61 @@ const fn refusal(refusal: Refusal) -> &'static str {
         Refusal::VersionChanged => "version_changed",
         Refusal::Arity => "arity",
         Refusal::Inconsistent => "inconsistent",
-        _ => "refused",
     }
 }
 
 type Shape = (Small, Small, Number, Number);
+
+const INVALID_SCHEMA: &str =
+    "fanout must be in 2..=MAX_FANOUT and fanout**depth must fit in 64 bits";
+
+/// The core's `Schema::new`, which Ruby's `Schema.new` answers for: a shape
+/// the core has no value for is malformed input, not a refusal.
+fn schema(ruby: &Ruby, (fanout, depth, partitioning, digest): Shape) -> Result<Schema, Error> {
+    Schema::new(fanout.0, depth.0, partitioning.0, digest.0)
+        .ok_or_else(|| Error::new(ruby.exception_range_error(), INVALID_SCHEMA))
+}
+
+/// Raises exactly when the core cannot build this schema.
+fn check_schema(
+    ruby: &Ruby,
+    fanout: Small,
+    depth: Small,
+    partitioning: Number,
+    digest: Number,
+) -> Result<(), Error> {
+    schema(ruby, (fanout, depth, partitioning, digest)).map(|_| ())
+}
+
+fn schema_leaves(ruby: &Ruby, shape: Shape) -> Result<u64, Error> {
+    Ok(schema(ruby, shape)?.leaves())
+}
+
+fn schema_width(ruby: &Ruby, shape: Shape, level: Small) -> Result<u64, Error> {
+    Ok(schema(ruby, shape)?.width(level.0))
+}
+
+fn schema_span(ruby: &Ruby, shape: Shape, node: Place) -> Result<Option<(u64, u64)>, Error> {
+    let node = Node {
+        level: node.0.0,
+        index: node.1.0,
+    };
+    Ok(schema(ruby, shape)?.span(node).map(bounds))
+}
+
+fn schema_compatible(ruby: &Ruby, shape: Shape, other: Shape) -> Result<Symbol, Error> {
+    let compatible = schema(ruby, shape)?.compatible(&schema(ruby, other)?);
+    Ok(ruby.to_symbol(match compatible {
+        Ok(()) => "compatible",
+        Err(reason) => mismatch(reason),
+    }))
+}
+
+const fn bounds(range: LeafRange) -> (u64, u64) {
+    (range.start, range.end)
+}
+
+type Place = (Small, Number);
 type Pins = (Number, Number);
 type Ticket = (Number, Small, Number);
 
@@ -134,12 +191,7 @@ impl Survey {
         remote_root: Digest,
     ) -> Result<Symbol, Error> {
         this.check_frozen()?;
-        let shape = |(fanout, depth, partitioning, digest): Shape| {
-            Schema::new(fanout.0, depth.0, partitioning.0, digest.0)
-        };
-        let (Some(local), Some(remote)) = (shape(local), shape(remote)) else {
-            return Ok(ruby.to_symbol("invalid_schema"));
-        };
+        let (local, remote) = (schema(ruby, local)?, schema(ruby, remote)?);
         let begun =
             this.core
                 .borrow_mut()
@@ -174,17 +226,23 @@ impl Survey {
         Ok(ruby.to_symbol(answered.map_or_else(refusal, |()| "accepted")))
     }
 
-    fn requeue(this: Obj<Self>, ticket: Ticket) -> Result<bool, Error> {
+    fn requeue(ruby: &Ruby, this: Obj<Self>, ticket: Ticket) -> Result<Symbol, Error> {
         this.check_frozen()?;
-        Ok(this.core.borrow_mut().requeue(request(ticket)))
+        let requeued = this.core.borrow_mut().requeue(request(ticket));
+        Ok(ruby.to_symbol(requeued.map_or_else(refusal, |()| "requeued")))
     }
 
-    fn take_ranges(this: Obj<Self>, limit: Number) -> Result<Vec<(u64, u64)>, Error> {
+    fn pop_range(this: Obj<Self>) -> Result<Option<(u64, u64)>, Error> {
+        this.check_frozen()?;
+        Ok(this.core.borrow_mut().pop_range().map(bounds))
+    }
+
+    fn drain(this: Obj<Self>, limit: Number) -> Result<Vec<(u64, u64)>, Error> {
         this.check_frozen()?;
         let mut taken = [LeafRange::default(); OUTPUT_CAPACITY];
         let limit = usize::try_from(limit.0).map_or(OUTPUT_CAPACITY, |n| n.min(OUTPUT_CAPACITY));
         let count = this.core.borrow_mut().drain(&mut taken[..limit]);
-        Ok(taken[..count].iter().map(|r| (r.start, r.end)).collect())
+        Ok(taken[..count].iter().copied().map(bounds).collect())
     }
 
     fn requeue_all(this: Obj<Self>) -> Result<usize, Error> {
@@ -192,9 +250,13 @@ impl Survey {
         Ok(this.core.borrow_mut().requeue_all())
     }
 
-    fn abort(this: Obj<Self>) -> Result<bool, Error> {
+    fn abort(ruby: &Ruby, this: Obj<Self>) -> Result<Symbol, Error> {
         this.check_frozen()?;
-        Ok(this.core.borrow_mut().abort())
+        let aborting = this.core.borrow_mut().abort();
+        Ok(ruby.to_symbol(match aborting {
+            Aborting::Aborted => "aborted",
+            Aborting::AlreadyIdle => "already_idle",
+        }))
     }
 
     fn phase(ruby: &Ruby, this: &Self) -> Symbol {
@@ -208,6 +270,21 @@ impl Survey {
 
     fn session(&self) -> u64 {
         self.core.borrow().session()
+    }
+
+    fn schema(&self) -> Option<(u8, u8, u64, u64)> {
+        let schema = self.core.borrow().schema()?;
+        Some((
+            schema.fanout(),
+            schema.depth(),
+            schema.partitioning(),
+            schema.digest(),
+        ))
+    }
+
+    fn versions(&self) -> Option<(u64, u64)> {
+        let versions = self.core.borrow().versions()?;
+        Some((versions.local, versions.remote))
     }
 
     fn pending(&self) -> usize {

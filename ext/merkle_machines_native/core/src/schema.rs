@@ -46,7 +46,6 @@ impl Node {
 
 /// First field on which two schemas disagree.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[non_exhaustive]
 pub enum Mismatch {
     /// Different number of children per node.
     Fanout,

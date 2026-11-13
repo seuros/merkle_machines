@@ -1,4 +1,5 @@
 mod buffer;
+mod refusal;
 
 use super::*;
 
@@ -84,6 +85,17 @@ fn reply<const P: usize, const O: usize>(
     let n = ours.children(request.node(), &mut a);
     theirs.children(request.node(), &mut b);
     survey.answer(request, V, &a[..n], &b[..n])
+}
+
+/// Requeue an in-flight request, then prove a repeat and a request from
+/// another session are refused by name and change nothing.
+fn requeue_once<const P: usize, const O: usize>(survey: &mut Survey<P, O>, request: Request) {
+    assert_eq!(survey.requeue(request), Ok(()));
+    let frozen = *survey;
+    assert_eq!(survey.requeue(request), Err(Refusal::Unexpected));
+    let other = Request::new(request.session() + 1, request.node());
+    assert_eq!(survey.requeue(other), Err(Refusal::Stale));
+    assert_eq!(*survey, frozen);
 }
 
 /// Drive one survey to completion under a random schedule and compare the
@@ -177,8 +189,7 @@ fn run<const P: usize, const O: usize>(rng: &mut Rng, fanout: u8, depth: u8) {
                     assert_eq!(survey.requeue_all(), lost);
                     flying = [None; 64];
                 } else if let Some(request) = flying.iter_mut().find_map(Option::take) {
-                    assert!(survey.requeue(request));
-                    assert!(!survey.requeue(request));
+                    requeue_once(&mut survey, request);
                 }
             }
         }
@@ -248,54 +259,6 @@ fn schema_validation_and_spans() {
 }
 
 #[test]
-fn mismatched_schemas_are_refused_without_a_session() {
-    let base = must(Schema::new(4, 3, 10, 20));
-    let cases = [
-        (Schema::new(8, 3, 10, 20), Mismatch::Fanout),
-        (Schema::new(4, 2, 10, 20), Mismatch::Depth),
-        (Schema::new(4, 3, 11, 20), Mismatch::Partitioning),
-        (Schema::new(4, 3, 10, 21), Mismatch::Digest),
-    ];
-    let mut survey = Survey::<4, 4>::new();
-    for (other, mismatch) in cases {
-        let refused = survey.begin(base, must(other), V, &1, &2);
-        assert_eq!(refused, Err(Refusal::Schema(mismatch)));
-        assert_eq!(survey, Survey::new());
-    }
-    assert_eq!(
-        (survey.phase(), survey.schema(), survey.versions()),
-        (Phase::Idle, None, None)
-    );
-}
-
-#[test]
-fn capacity_and_session_refusals_leave_the_survey_untouched() {
-    let deep = schema(2, 5);
-    assert_eq!(
-        Survey::<4, 4>::new().begin(deep, deep, V, &1, &2),
-        Err(Refusal::Undersized)
-    );
-    assert_eq!(
-        Survey::<5, 0>::new().begin(deep, deep, V, &1, &2),
-        Err(Refusal::Undersized)
-    );
-
-    let mut survey = Survey::<5, 1>::new();
-    assert_eq!(survey.begin(deep, deep, V, &1, &2), Ok(Begun::Diverged));
-    let frozen = survey;
-    assert_eq!(survey.begin(deep, deep, V, &1, &2), Err(Refusal::Busy));
-    assert_eq!(survey, frozen);
-    assert!(survey.abort());
-    assert!(!survey.abort());
-    assert_eq!(survey.phase(), Phase::Idle);
-
-    survey.session = u64::MAX;
-    let frozen = survey;
-    assert_eq!(survey.begin(deep, deep, V, &1, &2), Err(Refusal::Exhausted));
-    assert_eq!(survey, frozen);
-}
-
-#[test]
 fn identical_roots_and_single_leaf_trees() {
     let mut survey = Survey::<0, 1>::new();
     let leaf = schema(2, 0);
@@ -306,72 +269,6 @@ fn identical_roots_and_single_leaf_trees() {
     assert_eq!(survey.next_request(), None);
     assert_eq!(survey.pop_range(), Some(LeafRange { start: 0, end: 1 }));
     assert_eq!(survey.phase(), Phase::Complete);
-}
-
-#[test]
-fn answers_are_checked_before_anything_moves() {
-    let shape = schema(2, 2);
-    let mut survey = Survey::<2, 2>::new();
-    let forged = Request::new(1, Node::ROOT);
-    assert_eq!(
-        survey.answer(forged, V, &[1, 2], &[1, 3]),
-        Err(Refusal::Stale)
-    );
-    assert_eq!(survey.begin(shape, shape, V, &1, &2), Ok(Begun::Diverged));
-    assert_eq!(
-        survey.answer(forged, V, &[1, 2], &[1, 3]),
-        Err(Refusal::Unexpected)
-    );
-    let request = must(survey.next_request());
-    assert_eq!((request, survey.in_flight()), (forged, 1));
-    let frozen = survey;
-    let moved = Versions {
-        local: 8,
-        remote: 9,
-    };
-    let wrong_node = Request::new(1, Node { level: 1, index: 0 });
-    let refusals = [
-        (
-            survey.answer(Request::new(0, Node::ROOT), V, &[1, 2], &[1, 3]),
-            Refusal::Stale,
-        ),
-        (
-            survey.answer(wrong_node, V, &[1, 2], &[1, 3]),
-            Refusal::Unexpected,
-        ),
-        (
-            survey.answer(request, moved, &[1, 2], &[1, 3]),
-            Refusal::VersionChanged,
-        ),
-        (survey.answer(request, V, &[1], &[1, 3]), Refusal::Arity),
-        (
-            survey.answer(request, V, &[1, 2], &[1, 3, 4]),
-            Refusal::Arity,
-        ),
-        (
-            survey.answer(request, V, &[1, 2], &[1, 2]),
-            Refusal::Inconsistent,
-        ),
-    ];
-    for (got, want) in refusals {
-        assert_eq!(got, Err(want));
-    }
-    assert_eq!(survey, frozen);
-
-    assert_eq!(survey.answer(request, V, &[1, 2], &[1, 3]), Ok(()));
-    let child = must(survey.next_request());
-    assert_eq!(child.node(), Node { level: 1, index: 1 });
-    assert!(survey.abort());
-    assert_eq!(
-        survey.answer(child, V, &[1, 2], &[3, 4]),
-        Err(Refusal::Stale)
-    );
-    assert_eq!(survey.begin(shape, shape, V, &1, &2), Ok(Begun::Diverged));
-    assert_eq!(
-        survey.answer(child, V, &[1, 2], &[3, 4]),
-        Err(Refusal::Stale)
-    );
-    assert!(!survey.requeue(child));
 }
 
 #[test]

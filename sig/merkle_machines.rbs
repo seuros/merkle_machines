@@ -4,10 +4,19 @@ module MerkleMachines
   OUTPUT_CAPACITY: Integer
   MAX_FANOUT: Integer
 
-  type refusal = :fanout_mismatch | :depth_mismatch | :partitioning_mismatch | :digest_mismatch
-               | :invalid_schema | :undersized | :busy | :exhausted
-               | :stale | :unexpected | :version_changed | :arity | :inconsistent | :refused
+  # The core's `Mismatch`: the first field on which two schemas disagree.
+  type mismatch = :fanout_mismatch | :depth_mismatch | :partitioning_mismatch | :digest_mismatch
 
+  # Refusals are symbols, one per core reason, and a refused call changes
+  # nothing. `Refusal::Schema(Mismatch)` is the mismatch's own symbol.
+  type begin_refusal = mismatch | :undersized | :busy | :exhausted
+  type answer_refusal = :stale | :unexpected | :version_changed | :arity | :inconsistent
+  type requeue_refusal = :stale | :unexpected
+  type refusal = begin_refusal | answer_refusal | requeue_refusal
+
+  # Mirrors the core's `Schema`. Like `Schema::new`, `new` has no value for a
+  # `fanout` outside 2..MAX_FANOUT or a tree with more leaves than fit in 64
+  # bits: it raises RangeError (TypeError for a non-Integer).
   class Schema < Data
     attr_reader fanout: Integer
     attr_reader depth: Integer
@@ -15,6 +24,15 @@ module MerkleMachines
     attr_reader digest: Integer
     def self.new: (Integer fanout, Integer depth, Integer partitioning, Integer digest) -> Schema
                 | (fanout: Integer, depth: Integer, partitioning: Integer, digest: Integer) -> Schema
+    # Total number of leaves.
+    def leaves: () -> Integer
+    # Nodes at `level` (0..255), saturating past the leaf level.
+    def width: (Integer level) -> Integer
+    # Leaves below `node`, the core's `LeafRange` as a half-open Range; nil
+    # when the node is not part of the tree.
+    def span: (Node node) -> Range[Integer]?
+    # :compatible, or the first field on which `other` differs.
+    def compatible: (Schema other) -> (:compatible | mismatch)
   end
 
   class Versions < Data
@@ -24,25 +42,51 @@ module MerkleMachines
                 | (local: Integer, remote: Integer) -> Versions
   end
 
-  class Request < Data
-    attr_reader session: Integer
+  # Mirrors the core's `Node`.
+  class Node < Data
+    ROOT: Node
+
     attr_reader level: Integer
     attr_reader index: Integer
-    def self.new: (Integer session, Integer level, Integer index) -> Request
-                | (session: Integer, level: Integer, index: Integer) -> Request
+    def self.new: (Integer level, Integer index) -> Node
+                | (level: Integer, index: Integer) -> Node
+  end
+
+  # Mirrors the core's `Request`.
+  class Request < Data
+    attr_reader session: Integer
+    attr_reader node: Node
+    def self.new: (Integer session, Node node) -> Request
+                | (session: Integer, node: Node) -> Request
   end
 
   class Survey
     def self.new: () -> Survey
-    def begin: (Schema local, Schema remote, Versions versions, String local_root, String remote_root) -> (:identical | :diverged | refusal)
+    # Honoured: :identical, :diverged. Refused: begin_refusal.
+    def begin: (Schema local, Schema remote, Versions versions, String local_root, String remote_root) -> (:identical | :diverged | begin_refusal)
+    # The next node whose child digests are wanted, nil when nothing is queued.
+    # Never refuses.
     def next_request: () -> Request?
-    def answer: (Request request, Versions versions, Array[String] local_children, Array[String] remote_children) -> (:accepted | refusal)
-    def requeue: (Request request) -> bool
+    # Honoured: :accepted. Refused: answer_refusal.
+    def answer: (Request request, Versions versions, Array[String] local, Array[String] remote) -> (:accepted | answer_refusal)
+    # Honoured: :requeued. Refused: requeue_refusal.
+    def requeue: (Request request) -> (:requeued | requeue_refusal)
+    # How many in-flight requests went back to the queue. Never refuses.
     def requeue_all: () -> Integer
-    def take_ranges: (?Integer limit) -> Array[Range[Integer]]
-    def abort: () -> bool
+    # The lowest buffered leaf range, nil when none is buffered. Never refuses.
+    def pop_range: () -> Range[Integer]?
+    # At most `limit` buffered leaf ranges, lowest first, [] when none is
+    # buffered. Never refuses.
+    def drain: (Integer limit) -> Array[Range[Integer]]
+    # Honoured: :aborted when a session was dropped, and the repeat
+    # :already_idle when none was open (nothing changes). Never refuses.
+    def abort: () -> (:aborted | :already_idle)
     def phase: () -> (:idle | :surveying | :draining | :complete)
     def session: () -> Integer
+    # The schema of the open session, nil when the survey is idle.
+    def schema: () -> Schema?
+    # The versions the open session pinned, nil when the survey is idle.
+    def versions: () -> Versions?
     def pending: () -> Integer
     def in_flight: () -> Integer
     def buffered: () -> Integer

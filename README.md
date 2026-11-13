@@ -24,10 +24,10 @@ end
 until survey.phase == :complete
   if (request = survey.next_request)
     survey.answer(request, versions,
-                  mine.children(request.level, request.index),
-                  theirs.children(request.level, request.index))
+                  mine.children(request.node.level, request.node.index),
+                  theirs.children(request.node.level, request.node.index))
   end
-  survey.take_ranges.each { |leaves| repair(leaves) }
+  survey.drain(MerkleMachines::OUTPUT_CAPACITY).each { |leaves| repair(leaves) }
 end
 ```
 
@@ -70,7 +70,7 @@ stateDiagram-v2
     idle --> surveying: begin, roots differ
     surveying --> surveying: next_request / answer / requeue
     surveying --> draining: last node resolved
-    draining --> complete: take_ranges empties the buffer
+    draining --> complete: drain empties the buffer
     surveying --> complete: last node resolved, buffer already empty
     complete --> surveying: begin again
     surveying --> idle: abort
@@ -99,7 +99,7 @@ sequenceDiagram
     R-->>A: two digests
     A->>S: answer(request, versions, mine, theirs)
     S-->>A: :accepted
-    A->>S: take_ranges
+    A->>S: drain(8)
     S-->>A: [2...3]
 ```
 
@@ -113,6 +113,13 @@ schema = MerkleMachines::Schema.new(fanout: 2, depth: 2, partitioning: 1, digest
 
 `fanout` is children per node, from 2 to 64. `depth` is the number of levels below the root, so this tree has four leaves. `partitioning` and `digest` are numbers you choose to name how keys map to leaves and how digests are computed. The survey never interprets them. It only checks that both sides say the same thing.
 
+A shape that is not a tree is not a `Schema`. A fanout outside 2..64, or more leaves than fit in 64 bits, raises `RangeError` from `Schema.new`:
+
+```ruby
+MerkleMachines::Schema.new(fanout: 1, depth: 2, partitioning: 1, digest: 1)    # RangeError
+MerkleMachines::Schema.new(fanout: 2, depth: 64, partitioning: 1, digest: 1)   # RangeError
+```
+
 ### Begin
 
 ```ruby
@@ -123,6 +130,20 @@ survey.begin(schema, schema, versions, 'root-a', 'root-b')   # => :diverged
 survey.phase                                                  # => :surveying
 ```
 
+A schema answers the questions the core's does:
+
+```ruby
+schema.leaves                                       # => 4
+schema.width(1)                                     # => 2 nodes at level 1
+schema.span(MerkleMachines::Node.new(1, 1))         # => 2...4, the leaves below that node
+schema.span(MerkleMachines::Node.new(3, 0))         # => nil, not a node of this tree
+schema.span(MerkleMachines::Node::ROOT)             # => 0...4
+schema.compatible(schema.with(fanout: 4))           # => :fanout_mismatch
+schema.compatible(schema)                           # => :compatible
+survey.schema                                       # => the open session's Schema, nil when idle
+survey.versions                                     # => the Versions it pinned, nil when idle
+```
+
 Equal roots answer `:identical` and the survey is `:complete` on the spot. Trees that can't be compared are refused by name, and no session opens:
 
 ```ruby
@@ -130,16 +151,16 @@ other = schema.with(fanout: 4)
 MerkleMachines::Survey.new.begin(schema, other, versions, 'a', 'b')   # => :fanout_mismatch
 ```
 
-The others are `:depth_mismatch`, `:partitioning_mismatch`, `:digest_mismatch`, and `:invalid_schema` for a fanout outside 2..64 or a tree with more leaves than fit in 64 bits. A survey that is still working answers `:busy`.
+The others are `:depth_mismatch`, `:partitioning_mismatch` and `:digest_mismatch`. A survey that is still working answers `:busy`.
 
 ### Request
 
 ```ruby
 request = survey.next_request
-# => #<data MerkleMachines::Request session=1, level=0, index=0>
+# => #<data MerkleMachines::Request session=1, node=#<data MerkleMachines::Node level=0, index=0>>
 ```
 
-A request names one node. Fetch that node's child digests from both trees, in child order. `nil` means nothing is queued right now: answers are still out, the range buffer is full, or the survey is finished. Call it as many times as you want requests in the air.
+A request names one node: `request.node` is a `Node` with a `level` (0 is the root) and an `index` within that level. Fetch that node's child digests from both trees, in child order. `nil` means nothing is queued right now: answers are still out, the range buffer is full, or the survey is finished. Call it as many times as you want requests in the air.
 
 ### Answer
 
@@ -147,7 +168,7 @@ A request names one node. Fetch that node's child digests from both trees, in ch
 survey.answer(request, versions, %w[left same], %w[left changed])   # => :accepted
 
 request = survey.next_request
-# => #<data MerkleMachines::Request session=1, level=1, index=1>
+# => #<data MerkleMachines::Request session=1, node=#<data MerkleMachines::Node level=1, index=1>>
 survey.answer(request, versions, %w[x y], %w[z y])                  # => :accepted
 ```
 
@@ -161,23 +182,25 @@ request = survey.next_request
 survey.answer(request, versions.with(remote: 58), %w[a b], %w[a c])   # => :version_changed
 survey.answer(request, versions, %w[a], %w[a c])                      # => :arity
 survey.answer(request, versions, %w[a b], %w[a b])                    # => :inconsistent
-survey.answer(request.with(level: 1), versions, %w[a b], %w[a c])     # => :unexpected
+elsewhere = request.with(node: request.node.with(level: 1))
+survey.answer(elsewhere, versions, %w[a b], %w[a c])                  # => :unexpected
 ```
 
 `:inconsistent` means the parents differed and no child does, so the digests didn't come from one tree. `:stale` is the answer to a request from a session that was aborted or replaced.
 
-### Take ranges
+### Drain
 
 ```ruby
 survey.answer(request, versions, %w[a b], %w[a c])    # => :accepted
 survey.answer(survey.next_request, versions, %w[x y], %w[z y])
 
 survey.phase         # => :draining
-survey.take_ranges   # => [2...3]
+survey.drain(8)      # => [2...3]
 survey.phase         # => :complete
+survey.pop_range     # => nil, nothing buffered
 ```
 
-Ranges are leaf indices, end excluded. One call returns them sorted, with neighbours joined. Pass a limit to take fewer: `take_ranges(8)`. Two calls can return ranges that touch each other, because the second one was found after you took the first.
+Ranges are leaf indices, end excluded. `drain(limit)` hands back at most `limit` of them, sorted, with neighbours joined, and keeps the rest buffered; `MerkleMachines::OUTPUT_CAPACITY` takes everything there can be. `pop_range` takes just the lowest one, or `nil`. Two calls can return ranges that touch each other, because the second one was found after you took the first.
 
 ### Requeue
 
@@ -188,20 +211,39 @@ survey = MerkleMachines::Survey.new
 survey.begin(schema, schema, versions, 'root-a', 'root-b')
 request = survey.next_request
 
-survey.requeue(request)   # => true
-survey.requeue(request)   # => false, it is not in flight any more
+survey.requeue(request)   # => :requeued
+survey.requeue(request)   # => :unexpected, it is not in flight any more
 survey.next_request == request   # => true
 survey.requeue_all        # => 1, for when the whole connection dropped
 ```
 
+`requeue` answers `:stale` for a request from a session that was aborted or replaced, and `:unexpected` for a node that is not in flight. Neither changes anything.
+
 ### Abort
 
 ```ruby
-survey.abort   # => true
+survey.abort   # => :aborted
 survey.phase   # => :idle
+survey.abort   # => :already_idle, there was no session to drop and nothing changed
 ```
 
 Abort when a tree moved under you. The buffered ranges are discarded, every outstanding request becomes `:stale`, and the next `begin` pins the new versions.
+
+### What each call answers
+
+| Call | Honoured | Refused, nothing changed |
+| --- | --- | --- |
+| `begin` | `:identical`, `:diverged` | `:fanout_mismatch`, `:depth_mismatch`, `:partitioning_mismatch`, `:digest_mismatch`, `:busy`, `:undersized`, `:exhausted` |
+| `answer` | `:accepted` | `:stale`, `:unexpected`, `:version_changed`, `:arity`, `:inconsistent` |
+| `requeue` | `:requeued` | `:stale`, `:unexpected` |
+| `requeue_all` | the number requeued | never refuses |
+| `drain(limit)` | an Array of Ranges, empty when none is buffered | never refuses |
+| `pop_range` | a Range, or `nil` when none is buffered | never refuses |
+| `next_request` | a `Request`, or `nil` when nothing is queued | never refuses |
+| `abort` | `:aborted`, or `:already_idle` when no session was open (an idempotent repeat) | never refuses |
+| `schema`, `versions` | the open session's `Schema` / `Versions`, or `nil` when the survey is idle | a query, never refuses |
+
+`:undersized` means the tree is deeper than `PENDING_CAPACITY`, and `:exhausted` means the session counter ran out after 2**64-1 sessions. Every refusal has its own symbol; there is no catch-all. The core's `Refusal::Schema(Mismatch)` answers with the mismatch's symbol, the same four `Schema#compatible` uses.
 
 ### Capacity
 
@@ -212,17 +254,17 @@ MerkleMachines::MAX_FANOUT         # => 64
 
 survey.pending     # nodes held: queued, in flight, or answered and waiting for room
 survey.in_flight   # requests out
-survey.buffered    # ranges waiting for take_ranges
+survey.buffered    # ranges waiting for drain
 ```
 
-A survey holds at most 64 nodes and 64 ranges. When the range buffer is full, answered nodes wait and `next_request` returns `nil` until you call `take_ranges`. Nothing is dropped and no answer is refused for lack of room.
+A survey holds at most 64 nodes and 64 ranges. When the range buffer is full, answered nodes wait and `next_request` returns `nil` until you call `drain` or `pop_range`. Nothing is dropped and no answer is refused for lack of room.
 
 ## The Rules of the Navigator
 
 - **Digests are Strings.** Use binary strings (`.b`). They are compared byte for byte, and two strings with the same bytes in incompatible encodings are different digests. Anything else raises `TypeError`.
 - **Numbers are Integers** in `0..2**64-1`. `fanout`, `depth`, and `level` stop at 255. Floats, nil, and strings raise `TypeError`. Out of range raises `RangeError`.
-- **Schemas, versions, and requests are value objects.** Pass a `Schema`, a `Versions`, a `Request`. An Array in their place raises `TypeError`.
-- **Refusals don't raise.** Every refusal is a Symbol or `false`, and a refused call changes nothing. Only malformed input raises.
+- **Schemas, versions, nodes, and requests are value objects.** `Schema`, `Versions`, `Node` and `Request` are frozen `Data` values with the fields of the core types they are named after. An Array in their place raises `TypeError`.
+- **Refusals don't raise.** Every refusal is a Symbol, and a refused call changes nothing. Only malformed input raises.
 - **One version of each tree per session.** Every answer names the versions its digests were read at. Different versions are refused.
 - **Frozen means frozen.** `freeze` the survey and every method that would change it raises `FrozenError`.
 

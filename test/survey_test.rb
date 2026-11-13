@@ -35,9 +35,13 @@ class SurveyTest < Minitest::Test
     survey
   end
 
+  def at(request, **fields) = request.with(node: request.node.with(**fields))
+
+  def deeper(request) = at(request, level: 1)
+
   def reply(survey, request, ours, theirs)
-    survey.answer(request, PINS, ours.children(request.level, request.index),
-                  theirs.children(request.level, request.index))
+    node = request.node
+    survey.answer(request, PINS, ours.children(node.level, node.index), theirs.children(node.level, node.index))
   end
 
   def test_locates_differing_leaf_ranges
@@ -55,10 +59,14 @@ class SurveyTest < Minitest::Test
     end
     assert_equal :draining, survey.phase
     assert_equal 3, survey.buffered
-    assert_equal [5...9], survey.take_ranges(1)
-    assert_equal [40...41, 63...64], survey.take_ranges
+    assert_equal [5...9], survey.drain(1)
+    assert_equal [], survey.drain(0)
+    assert_equal 40...41, survey.pop_range
+    assert_equal [63...64], survey.drain(OUTPUT_CAPACITY)
     assert_equal :complete, survey.phase
-    assert_equal [], survey.take_ranges
+    assert_equal [], survey.drain(OUTPUT_CAPACITY)
+    assert_nil survey.pop_range
+    assert_raises(ArgumentError) { survey.drain }
   end
 
   def test_identical_roots_and_single_leaf_tree
@@ -70,7 +78,7 @@ class SurveyTest < Minitest::Test
     leaf = schema(fanout: 2, depth: 0)
     assert_equal :diverged, survey.begin(leaf, leaf, PINS, 'a', 'b')
     assert_equal 2, survey.session
-    assert_equal [0...1], survey.take_ranges
+    assert_equal [0...1], survey.drain(8)
   end
 
   def test_schema_refusals_open_no_session
@@ -78,27 +86,93 @@ class SurveyTest < Minitest::Test
     base = schema
     {
       fanout_mismatch: schema(fanout: 8), depth_mismatch: schema(depth: 2),
-      partitioning_mismatch: schema(partitioning: 2), digest_mismatch: schema(digest: 2),
-      invalid_schema: schema(fanout: 1)
+      partitioning_mismatch: schema(partitioning: 2), digest_mismatch: schema(digest: 2)
     }.each do |refusal, other|
       assert_equal refusal, survey.begin(base, other, PINS, 'a', 'b')
     end
-    assert_equal :invalid_schema, survey.begin(schema(fanout: 65), schema(fanout: 65), PINS, 'a', 'b')
-    assert_equal :invalid_schema, survey.begin(schema(fanout: 2, depth: 64), base, PINS, 'a', 'b')
     assert_equal :idle, survey.phase
     assert_equal 0, survey.session
+  end
+
+  # The core has no Schema for these shapes, so neither does Ruby.
+  def test_schema_is_validated_like_the_core
+    assert_equal [2, 63], schema(fanout: 2, depth: 63).deconstruct.first(2)
+    assert_equal [64, 10], schema(fanout: 64, depth: 10).deconstruct.first(2)
+    [[1, 3], [0, 0], [65, 1], [2, 64], [64, 11]].each do |fanout, depth|
+      assert_raises(RangeError) { schema(fanout:, depth:) }
+      assert_raises(RangeError) { schema.with(fanout:, depth:) }
+    end
+    assert_raises(RangeError) { schema(partitioning: 2**64) }
+    assert_raises(RangeError) { schema(digest: -1) }
+    [1.0, nil, '2'].each { |bad| assert_raises(TypeError) { schema(fanout: bad) } }
+    assert_raises(NoMethodError) { MerkleMachines.check_schema(4, 3, 1, 1) }
+  end
+
+  def test_values_mirror_the_core
+    [Schema, Versions, Node, Request].each { assert_operator _1, :<, Data }
+    assert_equal %i[fanout depth partitioning digest], Schema.members
+    assert_equal %i[local remote], Versions.members
+    assert_equal %i[level index], Node.members
+    assert_equal %i[session node], Request.members
+  end
+
+  def test_schema_arithmetic_mirrors_the_core
+    shape = schema
+    assert_equal 64, shape.leaves
+    assert_equal [1, 4, 16, 64, 64, 64], [0, 1, 2, 3, 4, 255].map { shape.width(it) }
+    assert_equal Node.new(0, 0), Node::ROOT
+    assert_predicate Node::ROOT, :frozen?
+    assert_equal 0...64, shape.span(Node::ROOT)
+    assert_equal 16...32, shape.span(Node.new(1, 1))
+    assert_equal 63...64, shape.span(Node.new(3, 63))
+    assert_nil shape.span(Node.new(3, 64))
+    assert_nil shape.span(Node.new(4, 0))
+    assert_equal 2**63, schema(fanout: 2, depth: 63).leaves
+    assert_equal 0...1, schema(fanout: 2, depth: 0).span(Node::ROOT)
+    assert_raises(TypeError) { shape.width(1.0) }
+    assert_raises(RangeError) { shape.width(256) }
+    assert_raises(TypeError) { shape.span([0, 0]) }
+    assert_raises(RangeError) { shape.span(Node.new(0, -1)) }
+    assert_raises(TypeError) { shape.span(Node.new(nil, 0)) }
+    %i[schema_leaves schema_width schema_span schema_compatible fields].each do |name|
+      refute_respond_to MerkleMachines, name
+    end
+  end
+
+  def test_schema_compatibility_names_the_first_difference
+    base = schema
+    assert_equal :compatible, base.compatible(schema)
+    assert_equal :fanout_mismatch, base.compatible(schema(fanout: 8, depth: 2, partitioning: 2, digest: 2))
+    assert_equal :depth_mismatch, base.compatible(schema(depth: 2, partitioning: 2))
+    assert_equal :partitioning_mismatch, base.compatible(schema(partitioning: 2, digest: 2))
+    assert_equal :digest_mismatch, base.compatible(schema(digest: 2))
+    assert_raises(TypeError) { base.compatible([4, 3, 1, 1]) }
+  end
+
+  def test_schema_and_versions_of_the_open_session
+    survey = Survey.new
+    assert_nil survey.schema
+    assert_nil survey.versions
+    shape = schema(fanout: 2, depth: 2)
+    assert_equal :identical, survey.begin(shape, shape, PINS, 'a', 'a')
+    assert_equal [shape, PINS], [survey.schema, survey.versions]
+    assert_equal :aborted, survey.abort
+    assert_nil survey.schema
+    assert_nil survey.versions
   end
 
   def test_busy_abort_and_stale_requests
     survey = started
     assert_equal :busy, survey.begin(schema, schema, PINS, 'a', 'b')
     request = survey.next_request
-    assert_equal Request.new(session: 1, level: 0, index: 0), request
-    assert survey.abort
-    refute survey.abort
+    assert_equal Request.new(session: 1, node: Node.new(level: 0, index: 0)), request
+    assert_predicate request, :frozen?
+    assert_equal :aborted, survey.abort
+    assert_equal :already_idle, survey.abort
+    assert_equal :already_idle, Survey.new.abort
     assert_equal :idle, survey.phase
     assert_equal :stale, survey.answer(request, PINS, %w[a b], %w[a c])
-    refute survey.requeue(request)
+    assert_equal :stale, survey.requeue(request)
     started_again = schema(fanout: 2, depth: 2)
     assert_equal :diverged, survey.begin(started_again, started_again, PINS, 'a', 'b')
     assert_equal :stale, survey.answer(request, PINS, %w[a b], %w[a c])
@@ -107,22 +181,26 @@ class SurveyTest < Minitest::Test
   def test_answer_refusals_change_nothing
     survey = started
     request = survey.next_request
-    assert_equal :unexpected, survey.answer(request.with(level: 1), PINS, %w[a b], %w[a c])
+    assert_equal :unexpected, survey.answer(deeper(request), PINS, %w[a b], %w[a c])
     assert_equal :version_changed, survey.answer(request, PINS.with(remote: 58), %w[a b], %w[a c])
     assert_equal :arity, survey.answer(request, PINS, %w[a], %w[a c])
     assert_equal :inconsistent, survey.answer(request, PINS, %w[a b], %w[a b])
     assert_equal [1, 1, 0], [survey.pending, survey.in_flight, survey.buffered]
     assert_equal :accepted, survey.answer(request, PINS, %w[a b], %w[a c])
     assert_equal :unexpected, survey.answer(request, PINS, %w[a b], %w[a c])
-    assert_equal Request.new(session: 1, level: 1, index: 1), survey.next_request
+    assert_equal Request.new(1, Node.new(1, 1)), survey.next_request
   end
 
   def test_requeue_resumes_lost_requests
     survey = started
     request = survey.next_request
     assert_nil survey.next_request
-    assert survey.requeue(request)
-    refute survey.requeue(request)
+    assert_equal :stale, survey.requeue(request.with(session: 2))
+    assert_equal :unexpected, survey.requeue(deeper(request))
+    assert_equal [1, 1], [survey.pending, survey.in_flight]
+    assert_equal :requeued, survey.requeue(request)
+    assert_equal :unexpected, survey.requeue(request)
+    assert_equal [1, 0], [survey.pending, survey.in_flight]
     assert_equal 0, survey.in_flight
     assert_equal request, survey.next_request
     assert_equal 1, survey.requeue_all
@@ -142,7 +220,7 @@ class SurveyTest < Minitest::Test
       assert_operator survey.pending, :<=, PENDING_CAPACITY
       assert_operator survey.buffered, :<=, OUTPUT_CAPACITY
       request = survey.next_request
-      request ? reply(survey, request, ours, theirs) : found.concat(survey.take_ranges(7))
+      request ? reply(survey, request, ours, theirs) : found.concat(survey.drain(7))
     end
     assert_equal (0...256).step(2).map { |i| i...(i + 1) }, found.sort_by(&:begin)
   end
@@ -151,10 +229,11 @@ class SurveyTest < Minitest::Test
     survey = started
     request = survey.next_request
     [1.0, nil, '1', Object.new].each do |bad|
-      assert_raises(TypeError) { survey.answer(request.with(index: bad), PINS, %w[a b], %w[a c]) }
+      assert_raises(TypeError) { survey.answer(at(request, index: bad), PINS, %w[a b], %w[a c]) }
+      assert_raises(TypeError) { survey.answer(request.with(node: bad), PINS, %w[a b], %w[a c]) }
       assert_raises(TypeError) { survey.answer(request, PINS.with(local: bad), %w[a b], %w[a c]) }
       assert_raises(TypeError) { Survey.new.begin(schema(depth: bad), schema, PINS, 'a', 'b') }
-      assert_raises(TypeError) { survey.take_ranges(bad) }
+      assert_raises(TypeError) { survey.drain(bad) }
     end
     assert_raises(TypeError) { survey.answer(request, PINS, [1, 2], %w[a c]) }
     assert_raises(TypeError) { survey.answer(request, PINS, 'ab', %w[a c]) }
@@ -164,9 +243,10 @@ class SurveyTest < Minitest::Test
     assert_raises(TypeError) { Survey.new.begin(schema, schema, PINS, 1, 'b') }
     assert_raises(TypeError) { Survey.new.begin([4, 3, 1, 1], schema, PINS, 'a', 'b') }
     assert_raises(RangeError) { survey.answer(request.with(session: 2**64), PINS, %w[a b], %w[a c]) }
-    assert_raises(RangeError) { survey.answer(request.with(index: -1), PINS, %w[a b], %w[a c]) }
+    assert_raises(RangeError) { survey.answer(at(request, index: -1), PINS, %w[a b], %w[a c]) }
+    assert_raises(TypeError) { survey.requeue(request.with(node: [0, 0])) }
     assert_raises(RangeError) { Survey.new.begin(schema(fanout: 256), schema, PINS, 'a', 'b') }
-    assert_raises(RangeError) { survey.take_ranges(-1) }
+    assert_raises(RangeError) { survey.drain(-1) }
     assert_raises(TypeError) { Survey.allocate }
     assert_equal [1, 1], [survey.pending, survey.in_flight]
     assert_equal :accepted, survey.answer(request, PINS, %w[a b], %w[a c])
@@ -180,7 +260,7 @@ class SurveyTest < Minitest::Test
     request = survey.next_request
     assert_equal :accepted, survey.answer(request, top, ["\xFF".b, "\x01".b], ["\xFF".b, "\x02".b])
     assert_equal :accepted, survey.answer(survey.next_request, top, ['', 'x'], ['', 'y'])
-    assert_equal [3...4], survey.take_ranges(2**64 - 1)
+    assert_equal [3...4], survey.drain((2**64) - 1)
   end
 
   def test_freeze_guards
@@ -192,7 +272,9 @@ class SurveyTest < Minitest::Test
     assert_raises(FrozenError) { survey.answer(request, PINS, %w[a b], %w[a c]) }
     assert_raises(FrozenError) { survey.requeue(request) }
     assert_raises(FrozenError) { survey.requeue_all }
-    assert_raises(FrozenError) { survey.take_ranges }
+    assert_raises(FrozenError) { survey.drain(1) }
+    assert_raises(FrozenError) { survey.pop_range }
+    assert_equal [schema(fanout: 2, depth: 2), PINS], [survey.schema, survey.versions]
     assert_raises(FrozenError) { survey.abort }
     assert_equal [:surveying, 1], [survey.phase, survey.session]
     assert_equal [1, 1, 0], [survey.pending, survey.in_flight, survey.buffered]

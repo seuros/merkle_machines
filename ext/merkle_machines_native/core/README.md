@@ -24,8 +24,16 @@ leaf ranges and must be at least one. An answered node keeps its differing
 children as a bit mask and releases them only as slots and output space allow,
 so an answer is never refused for lack of room and a full buffer delays the
 traversal instead of losing work. Lost requests are requeued one by one or all
-at once. Every refusal leaves the survey unchanged. Requests carry a session
-counter, so answers to an aborted or replaced session are stale.
+at once. Every refusal is a `Refusal`, the crate's one refusal type, and leaves
+the survey unchanged: `begin`, `answer` and `requeue` return
+`Result<_, Refusal>`. Requests carry a session
+counter, so answers to an aborted or replaced session are stale. `abort` never
+refuses: it answers `Aborting::Aborted`, or `Aborting::AlreadyIdle` when no
+session was open, an idempotent repeat that changes nothing.
+
+The Ruby gem mirrors `Schema`, `Versions`, `Node` and `Request` as `Data`
+values of the same names and fields. Where `Schema::new` answers `None`, its
+`Schema.new` raises `RangeError`. A `LeafRange` is a half-open Ruby `Range`.
 
 Buffered ranges are sorted, disjoint and joined when they touch. Ranges taken at
 different times may still touch each other. The traversal visits only nodes
