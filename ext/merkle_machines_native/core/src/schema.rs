@@ -4,7 +4,10 @@
 pub const MAX_FANOUT: u8 = 64;
 
 /// Half-open range of leaf indices, `start..end`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+///
+/// `LeafRange::default()` is the empty range `0..0`, a placeholder for
+/// pre-filling an output buffer; a survey never emits an empty range.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct LeafRange {
     /// First leaf in the range.
     pub start: u64,

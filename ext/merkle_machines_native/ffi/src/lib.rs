@@ -181,7 +181,7 @@ impl Survey {
 
     fn take_ranges(this: Obj<Self>, limit: Number) -> Result<Vec<(u64, u64)>, Error> {
         this.check_frozen()?;
-        let mut taken = [LeafRange { start: 0, end: 0 }; OUTPUT_CAPACITY];
+        let mut taken = [LeafRange::default(); OUTPUT_CAPACITY];
         let limit = usize::try_from(limit.0).map_or(OUTPUT_CAPACITY, |n| n.min(OUTPUT_CAPACITY));
         let count = this.core.borrow_mut().drain(&mut taken[..limit]);
         Ok(taken[..count].iter().map(|r| (r.start, r.end)).collect())

@@ -34,6 +34,11 @@ round count. Equal digests are trusted to mean equal subtrees, so a digest
 collision hides a difference, and a parent that differs while none of its
 children do is refused as inconsistent.
 
+`pop_range` takes one range; `drain(out)` writes as many as fit into the front
+of `out`, returns the count and leaves the rest untouched. Build the buffer as
+`[LeafRange::default(); N]`: the default is the empty range `0..0`, a
+placeholder the survey never emits.
+
 ```rust
 use merkle_machines::{Begun, LeafRange, Phase, Schema, Survey, Versions};
 

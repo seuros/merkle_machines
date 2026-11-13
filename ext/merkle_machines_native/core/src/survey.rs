@@ -276,12 +276,13 @@ impl<const P: usize, const O: usize> Survey<P, O> {
         (self.drain(&mut one) == 1).then_some(one[0])
     }
 
-    /// Move buffered ranges into `into`, lowest first, until it is full or no
-    /// range is left, then let held-back nodes use the room. Returns how many
-    /// were written; those are sorted and do not touch each other.
-    pub fn drain(&mut self, into: &mut [LeafRange]) -> usize {
-        let taken = self.buffered.min(into.len());
-        into[..taken].copy_from_slice(&self.out[..taken]);
+    /// Move buffered ranges into the front of `out`, lowest first, until it is
+    /// full or no range is left, then let held-back nodes use the room. Returns
+    /// how many were written; those are sorted and do not touch each other, and
+    /// the rest of `out` is untouched.
+    pub fn drain(&mut self, out: &mut [LeafRange]) -> usize {
+        let taken = self.buffered.min(out.len());
+        out[..taken].copy_from_slice(&self.out[..taken]);
         self.out.copy_within(taken..self.buffered, 0);
         self.buffered -= taken;
         if taken > 0 {
