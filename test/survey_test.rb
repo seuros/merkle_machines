@@ -91,7 +91,7 @@ class SurveyTest < Minitest::Test
       assert_equal refusal, survey.begin(base, other, PINS, 'a', 'b')
     end
     assert_equal :idle, survey.phase
-    assert_equal 0, survey.session
+    assert_nil survey.session
   end
 
   # The core has no Schema for these shapes, so neither does Ruby.
@@ -170,7 +170,8 @@ class SurveyTest < Minitest::Test
     assert_equal :aborted, survey.abort
     assert_equal :already_idle, survey.abort
     assert_equal :already_idle, Survey.new.abort
-    assert_equal :idle, survey.phase
+    # Idle again, and `session` still answers the aborted session.
+    assert_equal [:idle, 1], [survey.phase, survey.session]
     assert_equal :stale, survey.answer(request, PINS, %w[a b], %w[a c])
     assert_equal :stale, survey.requeue(request)
     started_again = schema(fanout: 2, depth: 2)
@@ -199,22 +200,17 @@ class SurveyTest < Minitest::Test
     assert_equal before, [snapshot.(a), snapshot.(b)]
     assert_equal :accepted, a.answer(from_a, PINS, %w[a b], %w[a c])
     assert_equal :requeued, b.requeue(from_b)
-  end
-
-  # The core cannot pick a scope: two surveys left in scope zero issue the same
-  # sessions, and one honours the other's request.
-  def test_surveys_left_in_the_same_scope_still_alias
-    a = started
-    b = started
-    request = a.next_request
-    assert_equal request, b.next_request
-    assert_equal [0, 0, 0, 1], [a.scope, b.scope, request.scope, request.session]
-    assert_equal :accepted, b.answer(request, PINS, %w[a b], %w[a c])
+    # The core cannot pick a scope: two surveys left in one scope issue the
+    # same sessions, and one honours the other's request.
+    twin = Survey.with_scope(2)
+    assert_equal :diverged, twin.begin(shape, shape, PINS, 'a', 'b')
+    assert_equal from_b, twin.next_request
+    assert_equal :accepted, twin.answer(from_b, PINS, %w[a b], %w[a c])
   end
 
   def test_with_scope_takes_an_integer_scope
     survey = Survey.with_scope(65_535)
-    assert_equal [65_535, 0, 0, :idle], [survey.scope, survey.session, survey.issued, survey.phase]
+    assert_equal [65_535, nil, 0, :idle], [survey.scope, survey.session, survey.issued, survey.phase]
     assert_equal [0, 0], [Survey.new.scope, Survey.with_scope(0).scope]
     [1.0, nil, '1', Object.new].each { |value| assert_raises(TypeError) { Survey.with_scope(value) } }
     [-1, 65_536, 2**64].each { |scope| assert_raises(RangeError) { Survey.with_scope(scope) } }
@@ -237,6 +233,9 @@ class SurveyTest < Minitest::Test
 
     survey = Survey.resumed(first.scope, first.issued)
     assert_equal [5, 2, :idle, nil, 0], [survey.scope, survey.issued, survey.phase, survey.schema, survey.pending]
+    # Resumed and idle: the last session issued before the restart, not open.
+    assert_equal first.session, survey.session
+    assert_nil Survey.resumed(5, 0).session
     refused = -> { earlier.flat_map { |old| [survey.answer(old, PINS, %w[a b], %w[a c]), survey.requeue(old)] } }
     assert_equal [:stale] * 4, refused.()
     assert_equal :diverged, survey.begin(shape, shape, PINS, 'a', 'b')
@@ -290,7 +289,6 @@ class SurveyTest < Minitest::Test
     assert_equal :requeued, survey.requeue(request)
     assert_equal :unexpected, survey.requeue(request)
     assert_equal [1, 0], [survey.pending, survey.in_flight]
-    assert_equal 0, survey.in_flight
     assert_equal request, survey.next_request
     assert_equal 1, survey.requeue_all
     assert_equal 0, survey.requeue_all
@@ -338,6 +336,29 @@ class SurveyTest < Minitest::Test
     assert_raises(RangeError) { survey.drain(-1) }
     assert_raises(TypeError) { Survey.allocate }
     assert_equal [1, 1], [survey.pending, survey.in_flight]
+    assert_equal :accepted, survey.answer(request, PINS, %w[a b], %w[a c])
+  end
+
+  # The binding never loses work: answers are built natively without running
+  # Ruby code, so an `initialize` that raises cannot lose a node marked in flight.
+  def test_answers_come_back_when_initialize_raises
+    survey = started
+    overridden = [Request, Node].each do |type|
+      type.alias_method(:checked_initialize, :initialize)
+      type.define_method(:initialize) { |**| raise 'initialize must not run' }
+    end
+    begin
+      request = survey.next_request
+    ensure
+      overridden.each do |type|
+        type.alias_method(:initialize, :checked_initialize)
+        type.remove_method(:checked_initialize)
+      end
+    end
+    assert_equal [1, 1], [survey.pending, survey.in_flight]
+    assert_equal Request.new(1, Node::ROOT), request
+    assert_predicate request, :frozen?
+    assert_predicate request.node, :frozen?
     assert_equal :accepted, survey.answer(request, PINS, %w[a b], %w[a c])
   end
 

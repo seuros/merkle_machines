@@ -35,6 +35,8 @@ module MerkleMachines
     def compatible: (Schema other) -> (:compatible | mismatch)
   end
 
+  # Mirrors the core's `Versions`: Integers in 0..2**64-1. `new` raises
+  # TypeError for a non-Integer and RangeError outside the range.
   class Versions < Data
     attr_reader local: Integer
     attr_reader remote: Integer
@@ -42,7 +44,8 @@ module MerkleMachines
                 | (local: Integer, remote: Integer) -> Versions
   end
 
-  # Mirrors the core's `Node`.
+  # Mirrors the core's `Node`: `level` in 0..255, `index` in 0..2**64-1.
+  # `new` raises TypeError for a non-Integer and RangeError outside the range.
   class Node < Data
     ROOT: Node
 
@@ -54,13 +57,16 @@ module MerkleMachines
 
   # Mirrors the core's `Request`. `session` is a scoped id: the issuing
   # survey's scope in the top 16 bits, its session count (from one) below.
+  # Like `Request::new`, `new` has no value for a session of sequence number
+  # zero, which no survey issues: RangeError, as for a session outside
+  # 0..2**64-1; TypeError for a non-Integer session or a node that is not a
+  # Node.
   class Request < Data
     attr_reader session: Integer
     attr_reader node: Node
     def self.new: (Integer session, Node node) -> Request
                 | (session: Integer, node: Node) -> Request
-    # The scope of the survey that issued the session, 0..65535. TypeError
-    # for a non-Integer session, RangeError outside 0..2**64-1.
+    # The scope of the survey that issued the session, 0..65535.
     def scope: () -> Integer
   end
 
@@ -93,14 +99,17 @@ module MerkleMachines
     # The lowest buffered leaf range, nil when none is buffered. Never refuses.
     def pop_range: () -> Range[Integer]?
     # At most `limit` buffered leaf ranges, lowest first, [] when none is
-    # buffered. Never refuses.
+    # buffered. A limit above OUTPUT_CAPACITY takes them all. Never refuses.
     def drain: (Integer limit) -> Array[Range[Integer]]
     # Honoured: :aborted when a session was dropped, and the repeat
     # :already_idle when none was open (nothing changes). Never refuses.
     def abort: () -> (:aborted | :already_idle)
     def phase: () -> (:idle | :surveying | :draining | :complete)
-    # The id of the latest session; 0 until the first one begins.
-    def session: () -> Integer
+    # The id of the latest session issued in this scope, open or not; nil
+    # while none was ever begun. After `abort` it is the aborted session; a
+    # resumed survey, idle until its next `begin`, answers the last session
+    # issued before the restart (nil when resumed from a count of zero).
+    def session: () -> Integer?
     # The schema of the open session, nil when the survey is idle.
     def schema: () -> Schema?
     # The versions the open session pinned, nil when the survey is idle.

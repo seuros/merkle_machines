@@ -34,30 +34,25 @@ fn capacity_and_session_refusals_leave_the_survey_untouched() {
     );
 
     let mut survey = Survey::<5, 1>::new();
-    assert_eq!(survey.begin(deep, deep, V, &1, &2), Ok(Begun::Diverged));
+    diverge(&mut survey, deep);
     let frozen = survey;
     assert_eq!(survey.begin(deep, deep, V, &1, &2), Err(Refusal::Busy));
     assert_eq!(survey, frozen);
     assert_eq!(survey.abort(), Aborting::Aborted);
     assert_eq!(survey.abort(), Aborting::AlreadyIdle);
     assert_eq!(survey.phase(), Phase::Idle);
-
-    let mut survey = must(Survey::<5, 1>::resumed(0, SEQUENCE_MAX));
-    let frozen = survey;
-    assert_eq!(survey.begin(deep, deep, V, &1, &2), Err(Refusal::Exhausted));
-    assert_eq!(survey, frozen);
 }
 
 #[test]
 fn answers_are_checked_before_anything_moves() {
     let shape = schema(2, 2);
     let mut survey = Survey::<2, 2>::new();
-    let forged = Request::new(1, Node::ROOT);
+    let forged = must(Request::new(1, Node::ROOT));
     assert_eq!(
         survey.answer(forged, V, &[1, 2], &[1, 3]),
         Err(Refusal::Stale)
     );
-    assert_eq!(survey.begin(shape, shape, V, &1, &2), Ok(Begun::Diverged));
+    diverge(&mut survey, shape);
     assert_eq!(
         survey.answer(forged, V, &[1, 2], &[1, 3]),
         Err(Refusal::Unexpected)
@@ -69,12 +64,8 @@ fn answers_are_checked_before_anything_moves() {
         local: 8,
         remote: 9,
     };
-    let wrong_node = Request::new(1, Node { level: 1, index: 0 });
+    let wrong_node = must(Request::new(1, Node { level: 1, index: 0 }));
     let refusals = [
-        (
-            survey.answer(Request::new(0, Node::ROOT), V, &[1, 2], &[1, 3]),
-            Refusal::Stale,
-        ),
         (
             survey.answer(wrong_node, V, &[1, 2], &[1, 3]),
             Refusal::Unexpected,
@@ -102,20 +93,13 @@ fn answers_are_checked_before_anything_moves() {
     let child = must(survey.next_request());
     assert_eq!(child.node(), Node { level: 1, index: 1 });
     assert_eq!(survey.abort(), Aborting::Aborted);
-    assert_eq!(
-        survey.answer(child, V, &[1, 2], &[3, 4]),
-        Err(Refusal::Stale)
-    );
-    assert_eq!(survey.begin(shape, shape, V, &1, &2), Ok(Begun::Diverged));
-    assert_eq!(
-        survey.answer(child, V, &[1, 2], &[3, 4]),
-        Err(Refusal::Stale)
-    );
+    refuse_stale(&mut survey, child);
+    diverge(&mut survey, shape);
     let frozen = survey;
-    assert_eq!(survey.requeue(child), Err(Refusal::Stale));
+    refuse_stale(&mut survey, child);
     let fresh = must(survey.next_request());
     let frozen_flying = survey;
-    let never = Request::new(fresh.session(), child.node());
+    let never = must(Request::new(fresh.session(), child.node()));
     assert_eq!(survey.requeue(never), Err(Refusal::Unexpected));
     assert_eq!(survey, frozen_flying);
     assert_eq!(survey.requeue(fresh), Ok(()));

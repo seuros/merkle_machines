@@ -1,4 +1,3 @@
-mod buffer;
 mod refusal;
 mod scope;
 
@@ -27,6 +26,24 @@ fn at(index: u64) -> usize {
 
 fn schema(fanout: u8, depth: u8) -> Schema {
     must(Schema::new(fanout, depth, 1, 1))
+}
+
+fn range(start: u64, end: u64) -> LeafRange {
+    must(LeafRange::new(start, end))
+}
+
+/// Begin a session on two trees whose roots differ.
+fn diverge<const P: usize, const O: usize>(survey: &mut Survey<P, O>, shape: Schema) {
+    assert_eq!(survey.begin(shape, shape, V, &1, &2), Ok(Begun::Diverged));
+}
+
+/// Both calls that take a request refuse it as stale.
+fn refuse_stale<const P: usize, const O: usize>(survey: &mut Survey<P, O>, request: Request) {
+    let stale = survey.answer(request, V, &[1, 2], &[1, 3]);
+    assert_eq!(
+        (stale, survey.requeue(request)),
+        (Err(Refusal::Stale), Err(Refusal::Stale))
+    );
 }
 
 /// Naive reference tree: a node's digest is a mix of its children's digests.
@@ -93,18 +110,16 @@ fn reply<const P: usize, const O: usize>(
 /// The same node and session number as `request`, from another survey's scope.
 fn foreign(request: Request) -> Request {
     let scope = request.scope().wrapping_add(1);
-    Request::new(
+    must(Request::new(
         scoped(scope, sequence_of(request.session())),
         request.node(),
-    )
+    ))
 }
 
 /// An in-flight request from another scope is refused and changes nothing.
 fn refuse_foreign<const P: usize, const O: usize>(survey: &mut Survey<P, O>, request: Request) {
     let frozen = *survey;
-    assert_eq!(survey.requeue(foreign(request)), Err(Refusal::Stale));
-    let stale = survey.answer(foreign(request), V, &[1, 2], &[1, 3]);
-    assert_eq!(stale, Err(Refusal::Stale));
+    refuse_stale(survey, foreign(request));
     assert_eq!(*survey, frozen);
 }
 
@@ -115,7 +130,7 @@ fn requeue_once<const P: usize, const O: usize>(survey: &mut Survey<P, O>, reque
     assert_eq!(survey.requeue(request), Ok(()));
     let frozen = *survey;
     assert_eq!(survey.requeue(request), Err(Refusal::Unexpected));
-    let other = Request::new(request.session() + 1, request.node());
+    let other = must(Request::new(request.session() + 1, request.node()));
     assert_eq!(survey.requeue(other), Err(Refusal::Stale));
     assert_eq!(survey.requeue(foreign(request)), Err(Refusal::Stale));
     assert_eq!(*survey, frozen);
@@ -194,19 +209,19 @@ fn run<const P: usize, const O: usize>(rng: &mut Rng, fanout: u8, depth: u8) {
                 }
             }
             6 => {
-                let mut taken = [LeafRange { start: 0, end: 0 }; 3];
+                let mut taken = [LeafRange::default(); 3];
                 let want = at(rng.below(4));
                 let got = survey.drain(&mut taken[..want]);
                 for range in &taken[..got] {
-                    assert!(!range.is_empty() && range.end <= shape.leaves());
-                    for leaf in range.start..range.end {
+                    assert!(!range.is_empty() && range.end() <= shape.leaves());
+                    for leaf in range.start()..range.end() {
                         let leaf = at(leaf);
                         assert!(!seen[leaf], "leaf {leaf} emitted twice");
                         seen[leaf] = true;
                     }
                 }
                 for pair in taken[..got].windows(2) {
-                    assert!(pair[0].end < pair[1].start, "sorted and coalesced");
+                    assert!(pair[0].end() < pair[1].start(), "sorted and coalesced");
                 }
             }
             _ => {
@@ -261,7 +276,7 @@ fn schema_validation_and_spans() {
     };
     let span = must(wide.span(last));
     assert_eq!(
-        (span.start, span.end, span.len()),
+        (span.start(), span.end(), span.len()),
         ((1 << 63) - 1, 1 << 63, 1)
     );
     assert_eq!(must(wide.span(Node::ROOT)).len(), 1 << 63);
@@ -292,9 +307,18 @@ fn identical_roots_and_single_leaf_trees() {
     assert_eq!(survey.begin(leaf, leaf, V, &5, &5), Ok(Begun::Identical));
     assert_eq!(survey.phase(), Phase::Complete);
     assert_eq!(survey.begin(leaf, leaf, V, &5, &6), Ok(Begun::Diverged));
-    assert_eq!((survey.phase(), survey.session()), (Phase::Draining, 2));
+    assert_eq!(
+        (survey.phase(), survey.session()),
+        (Phase::Draining, Some(2))
+    );
     assert_eq!(survey.next_request(), None);
-    assert_eq!(survey.pop_range(), Some(LeafRange { start: 0, end: 1 }));
+    // The default buffer is filled from the front; the rest stays untouched.
+    let mut out = [LeafRange::default(); 3];
+    assert_eq!(survey.drain(&mut out), 1);
+    assert_eq!(
+        out,
+        [range(0, 1), LeafRange::default(), LeafRange::default()]
+    );
     assert_eq!(survey.phase(), Phase::Complete);
 }
 
@@ -303,8 +327,8 @@ fn full_buffers_hold_nodes_back_until_the_caller_drains() {
     // Leaves 0, 2, 4 and 6 differ: four separate ranges through a one-range buffer.
     let shape = schema(2, 3);
     let mut survey = Survey::<3, 1>::new();
-    assert_eq!(survey.begin(shape, shape, V, &0, &1), Ok(Begun::Diverged));
-    let mut taken = [LeafRange { start: 0, end: 0 }; 8];
+    diverge(&mut survey, shape);
+    let mut taken = [LeafRange::default(); 8];
     let mut got = 0;
     let mut most_pending = 0;
     while survey.phase() != Phase::Complete {
@@ -319,10 +343,7 @@ fn full_buffers_hold_nodes_back_until_the_caller_drains() {
         }
     }
     taken[..got].sort_unstable_by_key(|range| range.start);
-    let starts = [0, 2, 4, 6].map(|start| LeafRange {
-        start,
-        end: start + 1,
-    });
+    let starts = [0, 2, 4, 6].map(|start| range(start, start + 1));
     assert_eq!((&taken[..got], most_pending), (&starts[..], 3));
 }
 
@@ -331,7 +352,7 @@ fn ranges_coalesce_across_nodes_at_the_top_of_the_index_space() {
     // Fanout 2, depth 63: follow the rightmost path, then its left neighbour.
     let shape = schema(2, 63);
     let mut survey = Survey::<63, 2>::new();
-    assert_eq!(survey.begin(shape, shape, V, &0, &1), Ok(Begun::Diverged));
+    diverge(&mut survey, shape);
     let mut requests = 0;
     while let Some(request) = survey.next_request() {
         requests += 1;
@@ -345,13 +366,28 @@ fn ranges_coalesce_across_nodes_at_the_top_of_the_index_space() {
         assert_eq!(survey.answer(request, V, &[0, 0], &theirs), Ok(()));
     }
     let top = 1_u64 << 63;
-    let joined = LeafRange {
-        start: top - 3,
-        end: top - 1,
-    };
-    assert_eq!((requests, survey.pop_range()), (64, Some(joined)));
+    assert_eq!(
+        (requests, survey.pop_range()),
+        (64, Some(range(top - 3, top - 1)))
+    );
     assert_eq!(
         (survey.pop_range(), survey.phase()),
         (None, Phase::Complete)
     );
+}
+
+/// Regression: a hand-built `LeafRange { start: 5, end: 3 }` made `len()`
+/// underflow (a panic in debug builds). No backwards range can be built now.
+#[test]
+fn a_leaf_range_never_runs_backwards() {
+    assert_eq!(LeafRange::new(5, 3), None);
+    for (start, end, len) in [(0, 0, 0), (3, 3, 0), (3, 5, 2), (0, u64::MAX, u64::MAX)] {
+        let leaves = range(start, end);
+        assert_eq!(
+            (leaves.start(), leaves.end(), leaves.len()),
+            (start, end, len)
+        );
+        assert_eq!(leaves.is_empty(), len == 0);
+    }
+    assert_eq!(LeafRange::default(), range(0, 0));
 }

@@ -1,10 +1,14 @@
 //! Thin binding to the bounded digest-tree survey.
 mod init;
+mod values;
+
+use values::{build, classes};
 
 use std::{cell::RefCell, cmp::Ordering};
 
 use magnus::{
-    Error, Integer, RArray, RString, Ruby, Symbol, TryConvert, Value, prelude::*, typed_data::Obj,
+    Error, Integer, RArray, RString, Range, Ruby, Symbol, TryConvert, Value, prelude::*,
+    typed_data::Obj,
 };
 use merkle_machines::{
     Aborting, Begun, LeafRange, Mismatch, Node, Phase, Refusal, Request, Schema, Versions,
@@ -14,12 +18,13 @@ const PENDING_CAPACITY: usize = 64;
 const OUTPUT_CAPACITY: usize = 64;
 const MAX_FANOUT: u8 = merkle_machines::MAX_FANOUT;
 
+fn type_error(value: Value, message: &'static str) -> Error {
+    Error::new(Ruby::get_with(value).exception_type_error(), message)
+}
+
 fn integer(value: Value) -> Result<Value, Error> {
     if Integer::from_value(value).is_none() {
-        return Err(Error::new(
-            Ruby::get_with(value).exception_type_error(),
-            "expected an Integer",
-        ));
+        return Err(type_error(value, "expected an Integer"));
     }
     Ok(value)
 }
@@ -58,12 +63,9 @@ struct Digest(RString);
 
 impl TryConvert for Digest {
     fn try_convert(value: Value) -> Result<Self, Error> {
-        RString::from_value(value).map(Self).ok_or_else(|| {
-            Error::new(
-                Ruby::get_with(value).exception_type_error(),
-                "expected a String digest",
-            )
-        })
+        RString::from_value(value)
+            .map(Self)
+            .ok_or_else(|| type_error(value, "expected a String digest"))
     }
 }
 
@@ -75,10 +77,7 @@ impl PartialEq for Digest {
 
 fn digests(list: Value) -> Result<Vec<Digest>, Error> {
     let Some(list) = RArray::from_value(list) else {
-        return Err(Error::new(
-            Ruby::get_with(list).exception_type_error(),
-            "expected an Array of String digests",
-        ));
+        return Err(type_error(list, "expected an Array of String digests"));
     };
     list.into_iter().map(Digest::try_convert).collect()
 }
@@ -138,12 +137,11 @@ fn schema_width(ruby: &Ruby, shape: Shape, level: Small) -> Result<u64, Error> {
     Ok(schema(ruby, shape)?.width(level.0))
 }
 
-fn schema_span(ruby: &Ruby, shape: Shape, node: Place) -> Result<Option<(u64, u64)>, Error> {
-    let node = Node {
-        level: node.0.0,
-        index: node.1.0,
-    };
-    Ok(schema(ruby, shape)?.span(node).map(bounds))
+fn schema_span(ruby: &Ruby, shape: Shape, node: Place) -> Result<Option<Range>, Error> {
+    schema(ruby, shape)?
+        .span(self::node(node))
+        .map(|span| leaves(ruby, span))
+        .transpose()
 }
 
 fn schema_compatible(ruby: &Ruby, shape: Shape, other: Shape) -> Result<Symbol, Error> {
@@ -154,8 +152,9 @@ fn schema_compatible(ruby: &Ruby, shape: Shape, other: Shape) -> Result<Symbol, 
     }))
 }
 
-const fn bounds(range: LeafRange) -> (u64, u64) {
-    (range.start, range.end)
+/// A leaf range as the half-open Ruby `Range` `start...end`.
+fn leaves(ruby: &Ruby, range: LeafRange) -> Result<Range, Error> {
+    ruby.range_new(range.start(), range.end(), true)
 }
 
 type Place = (Small, Number);
@@ -169,25 +168,73 @@ const fn versions(pins: Pins) -> Versions {
     }
 }
 
-const fn request(ticket: Ticket) -> Request {
-    Request::new(
-        ticket.0.0,
-        Node {
-            level: ticket.1.0,
-            index: ticket.2.0,
-        },
-    )
+const fn node(place: Place) -> Node {
+    Node {
+        level: place.0.0,
+        index: place.1.0,
+    }
+}
+
+/// The core's `Request::new`: a session of sequence zero names no session, so
+/// no request exists for it.
+fn request(ruby: &Ruby, ticket: Ticket) -> Result<Request, Error> {
+    Request::new(ticket.0.0, node((ticket.1, ticket.2))).ok_or_else(|| {
+        Error::new(
+            ruby.exception_range_error(),
+            "session has sequence number zero, which no survey issues",
+        )
+    })
+}
+
+/// `Node.new`: every field converts to the core's type or raises.
+const fn check_node(_level: Small, _index: Number) {}
+
+/// `Versions.new`: every field converts to the core's type or raises.
+const fn check_versions(_local: Number, _remote: Number) {}
+
+/// `Request.new`: raises exactly when the core has no request for it.
+fn check_request(ruby: &Ruby, session: Number, level: Small, index: Number) -> Result<(), Error> {
+    request(ruby, (session, level, index)).map(|_| ())
 }
 
 /// `Request#scope`: the core's `Request::scope`, so the id layout stays the
 /// core's business.
-const fn request_scope(session: Number) -> u16 {
-    Request::new(session.0, Node::ROOT).scope()
+fn request_scope(ruby: &Ruby, session: Number) -> Result<u16, Error> {
+    Ok(request(ruby, (session, Small(0), Number(0)))?.scope())
+}
+
+type Core = merkle_machines::Survey<PENDING_CAPACITY, OUTPUT_CAPACITY>;
+
+/// Runs `act`, which builds a Ruby answer, on a copy of the survey and keeps
+/// the copy only once the answer exists. The receiver is checked frozen up
+/// front and again right before the store; frozen meanwhile raises
+/// `FrozenError`, changed meanwhile (a call back in while the answer was
+/// built) raises `RuntimeError`, and in both cases nothing is applied. No
+/// borrow is held while `act` runs.
+fn on_copy<R>(
+    ruby: &Ruby,
+    this: Obj<Survey>,
+    act: impl FnOnce(&mut Core) -> Result<R, Error>,
+) -> Result<R, Error> {
+    this.check_frozen()?;
+    let before = *this.core.borrow();
+    let mut after = before;
+    let answer = act(&mut after)?;
+    this.check_frozen()?;
+    let mut held = this.core.borrow_mut();
+    if *held != before {
+        return Err(Error::new(
+            ruby.exception_runtime_error(),
+            "the survey changed while the answer was built; the call was not applied",
+        ));
+    }
+    *held = after;
+    Ok(answer)
 }
 
 #[magnus::wrap(class = "MerkleMachines::Survey", free_immediately, size)]
 struct Survey {
-    core: RefCell<merkle_machines::Survey<PENDING_CAPACITY, OUTPUT_CAPACITY>>,
+    core: RefCell<Core>,
 }
 
 impl Survey {
@@ -245,10 +292,24 @@ impl Survey {
         }))
     }
 
-    fn next_request(this: Obj<Self>) -> Result<Option<(u64, u8, u64)>, Error> {
-        this.check_frozen()?;
-        let request = this.core.borrow_mut().next_request();
-        Ok(request.map(|r| (r.session(), r.node().level, r.node().index)))
+    /// Decided on a copy, kept once the `Request` is built (see [`on_copy`]).
+    fn next_request(ruby: &Ruby, this: Obj<Self>) -> Result<Option<Value>, Error> {
+        let classes = classes(ruby)?;
+        on_copy(ruby, this, |core| {
+            let Some(request) = core.next_request() else {
+                return Ok(None);
+            };
+            let Node { level, index } = request.node();
+            let node = build(
+                classes.node,
+                [
+                    ruby.integer_from_u64(level.into()).as_value(),
+                    ruby.integer_from_u64(index).as_value(),
+                ],
+            )?;
+            let session = ruby.integer_from_u64(request.session()).as_value();
+            build(classes.request, [session, node]).map(Some)
+        })
     }
 
     fn answer(
@@ -260,31 +321,44 @@ impl Survey {
         remote: Value,
     ) -> Result<Symbol, Error> {
         this.check_frozen()?;
+        let request = request(ruby, ticket)?;
         let (local, remote) = (digests(local)?, digests(remote)?);
-        let answered =
-            this.core
-                .borrow_mut()
-                .answer(request(ticket), versions(pins), &local, &remote);
+        let answered = this
+            .core
+            .borrow_mut()
+            .answer(request, versions(pins), &local, &remote);
         Ok(ruby.to_symbol(answered.map_or_else(refusal, |()| "accepted")))
     }
 
     fn requeue(ruby: &Ruby, this: Obj<Self>, ticket: Ticket) -> Result<Symbol, Error> {
         this.check_frozen()?;
-        let requeued = this.core.borrow_mut().requeue(request(ticket));
+        let request = request(ruby, ticket)?;
+        let requeued = this.core.borrow_mut().requeue(request);
         Ok(ruby.to_symbol(requeued.map_or_else(refusal, |()| "requeued")))
     }
 
-    fn pop_range(this: Obj<Self>) -> Result<Option<(u64, u64)>, Error> {
-        this.check_frozen()?;
-        Ok(this.core.borrow_mut().pop_range().map(bounds))
+    fn pop_range(ruby: &Ruby, this: Obj<Self>) -> Result<Option<Range>, Error> {
+        on_copy(ruby, this, |core| {
+            core.pop_range()
+                .map(|range| leaves(ruby, range))
+                .transpose()
+        })
     }
 
-    fn drain(this: Obj<Self>, limit: Number) -> Result<Vec<(u64, u64)>, Error> {
-        this.check_frozen()?;
-        let mut taken = [LeafRange::default(); OUTPUT_CAPACITY];
+    /// The survey never buffers more than `OUTPUT_CAPACITY` ranges, so a
+    /// larger limit takes everything and loses nothing. The ranges are read
+    /// into a buffer, then built, inside one [`on_copy`].
+    fn drain(ruby: &Ruby, this: Obj<Self>, limit: Number) -> Result<RArray, Error> {
         let limit = usize::try_from(limit.0).map_or(OUTPUT_CAPACITY, |n| n.min(OUTPUT_CAPACITY));
-        let count = this.core.borrow_mut().drain(&mut taken[..limit]);
-        Ok(taken[..count].iter().copied().map(bounds).collect())
+        on_copy(ruby, this, |core| {
+            let mut taken = [LeafRange::default(); OUTPUT_CAPACITY];
+            let count = core.drain(&mut taken[..limit]);
+            let ranges = ruby.ary_new_capa(count);
+            for &range in &taken[..count] {
+                ranges.push(leaves(ruby, range)?)?;
+            }
+            Ok(ranges)
+        })
     }
 
     fn requeue_all(this: Obj<Self>) -> Result<usize, Error> {
@@ -310,7 +384,7 @@ impl Survey {
         })
     }
 
-    fn session(&self) -> u64 {
+    fn session(&self) -> Option<u64> {
         self.core.borrow().session()
     }
 

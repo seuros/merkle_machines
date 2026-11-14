@@ -13,7 +13,9 @@ gem 'merkle_machines'
 ```ruby
 schema   = MerkleMachines::Schema.new(fanout: 16, depth: 3, partitioning: 1, digest: 1)
 versions = MerkleMachines::Versions.new(local: mine.version, remote: theirs.version)
-survey   = MerkleMachines::Survey.new
+# One scope per survey whose requests could meet: two Survey.new are both
+# scope zero, open the same sessions, and honour each other's requests.
+survey   = MerkleMachines::Survey.with_scope(1)
 
 case survey.begin(schema, theirs.schema, versions, mine.root, theirs.root)
 when :identical then return
@@ -264,6 +266,11 @@ A restarted survey opens session 1 again, so a request that outlived the restart
 | `next_request` | a `Request`, or `nil` when nothing is queued | never refuses |
 | `abort` | `:aborted`, or `:already_idle` when no session was open (an idempotent repeat) | never refuses |
 | `schema`, `versions` | the open session's `Schema` / `Versions`, or `nil` when the survey is idle | a query, never refuses |
+| `session` | the latest session id issued in this scope, open or not; `nil` while none was ever begun | a query, never refuses |
+
+No answer records a clock: the survey takes no time at all. `Versions` are tree versions the caller pins, not instants, and nothing about them is remembered beyond the open session.
+
+`session` after `abort` is the aborted session. A resumed survey is idle until its next `begin` and answers the last session issued before the restart, or `nil` when it was resumed from a count of zero.
 
 `:undersized` means the tree is deeper than `PENDING_CAPACITY`, and `:exhausted` means the survey has opened all 2**48-1 sessions of its scope. Every refusal has its own symbol; there is no catch-all. The core's `Refusal::Schema(Mismatch)` answers with the mismatch's symbol, the same four `Schema#compatible` uses.
 
@@ -285,8 +292,10 @@ A survey holds at most 64 nodes and 64 ranges. When the range buffer is full, an
 
 - **Digests are Strings.** Use binary strings (`.b`). They are compared byte for byte, and two strings with the same bytes in incompatible encodings are different digests. Anything else raises `TypeError`.
 - **Numbers are Integers** in `0..2**64-1`. `fanout`, `depth`, and `level` stop at 255. Floats, nil, and strings raise `TypeError`. Out of range raises `RangeError`.
-- **Schemas, versions, nodes, and requests are value objects.** `Schema`, `Versions`, `Node` and `Request` are frozen `Data` values with the fields of the core types they are named after. An Array in their place raises `TypeError`.
-- **Scopes.** A `Request` is only meaningful to the survey that issued it. Give each survey its own scope with `Survey.with_scope(scope)`; the core cannot pick one. A `Request` from a survey in another scope is `:stale`. Two surveys in the same scope open the same sessions.
+- **Schemas, versions, nodes, and requests are value objects.** `Schema`, `Versions`, `Node` and `Request` are frozen `Data` values with the fields of the core types they are named after. An Array in their place raises `TypeError`. They are sealed (subclassing raises `TypeError`, `allocate` is undefined), and since sealing stops accidents, not reflection, the binding is the authority: every value it reads must be an instance of exactly its class, its fields are read straight from the struct and checked again by the core's constructors, so a forged value raises `TypeError` or `RangeError` and never reaches the survey.
+- **Values are valid or do not exist.** Every value is checked by the core when it is built, by you or by the gem: a wrong type raises `TypeError`, a value the core has none for raises `RangeError` (`Schema.new(fanout: 1, ...)`, `Node.new(256, 0)`, `Request.new(0, Node::ROOT)`: sequence zero is no session).
+- **A call that raises changed nothing.** Every check, and every class lookup, runs before the survey moves; the `Request` from `next_request` and the Ranges from `pop_range` and `drain` are built natively from what the core returned, without running any Ruby code (not even `initialize`), so no work is lost to a raise after it.
+- **Scopes.** A `Request` is only meaningful to the survey that issued it. Give each survey its own scope with `Survey.with_scope(scope)`; the core cannot pick one. A `Request` from a survey in another scope is `:stale`. Two surveys in the same scope, `Survey.new` twice included, open the same sessions and alias each other's requests.
 - **Restarts.** Resume from a saved count with `Survey.resumed(scope, issued)`, or give each incarnation a new scope. `resumed` restores the session sequence only; the survey is idle and comparing again is yours.
 - **Refusals don't raise.** Every refusal is a Symbol, and a refused call changes nothing. Only malformed input raises.
 - **One version of each tree per session.** Every answer names the versions its digests were read at. Different versions are refused.

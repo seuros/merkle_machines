@@ -1,17 +1,22 @@
 //! Private native entry point.
 use crate::{
-    MAX_FANOUT, OUTPUT_CAPACITY, PENDING_CAPACITY, Survey, check_schema, request_scope,
-    schema_compatible, schema_leaves, schema_span, schema_width,
+    MAX_FANOUT, OUTPUT_CAPACITY, PENDING_CAPACITY, Survey, check_node, check_request, check_schema,
+    check_versions, request_scope, schema_compatible, schema_leaves, schema_span, schema_width,
 };
 use magnus::{Error, Ruby, function, method, prelude::*};
 
 #[magnus::init]
 fn init(ruby: &Ruby) -> Result<(), Error> {
     let module = ruby.define_module("MerkleMachines")?;
+    crate::values::resolve(ruby, module)?;
+    module.define_singleton_method("fields", function!(crate::values::fields, 2))?;
     module.const_set("PENDING_CAPACITY", PENDING_CAPACITY)?;
     module.const_set("OUTPUT_CAPACITY", OUTPUT_CAPACITY)?;
     module.const_set("MAX_FANOUT", MAX_FANOUT)?;
     module.define_singleton_method("check_schema", function!(check_schema, 4))?;
+    module.define_singleton_method("check_node", function!(check_node, 2))?;
+    module.define_singleton_method("check_versions", function!(check_versions, 2))?;
+    module.define_singleton_method("check_request", function!(check_request, 3))?;
     module.define_singleton_method("schema_leaves", function!(schema_leaves, 1))?;
     module.define_singleton_method("schema_width", function!(schema_width, 2))?;
     module.define_singleton_method("schema_span", function!(schema_span, 2))?;
@@ -25,11 +30,11 @@ fn init(ruby: &Ruby) -> Result<(), Error> {
     class.define_method("scope", method!(Survey::scope, 0))?;
     class.define_method("issued", method!(Survey::issued, 0))?;
     class.define_private_method("native_begin", method!(Survey::begin, 5))?;
-    class.define_private_method("native_next_request", method!(Survey::next_request, 0))?;
+    class.define_method("next_request", method!(Survey::next_request, 0))?;
     class.define_private_method("native_answer", method!(Survey::answer, 4))?;
     class.define_private_method("native_requeue", method!(Survey::requeue, 1))?;
-    class.define_private_method("native_pop_range", method!(Survey::pop_range, 0))?;
-    class.define_private_method("native_drain", method!(Survey::drain, 1))?;
+    class.define_method("pop_range", method!(Survey::pop_range, 0))?;
+    class.define_method("drain", method!(Survey::drain, 1))?;
     class.define_private_method("native_schema", method!(Survey::schema, 0))?;
     class.define_private_method("native_versions", method!(Survey::versions, 0))?;
     class.define_method("requeue_all", method!(Survey::requeue_all, 0))?;

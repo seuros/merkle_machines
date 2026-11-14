@@ -1,55 +1,12 @@
 //! The bounded, resumable comparison traversal.
 
-use periscope_machines::{Issuer, scope_of, scoped};
+use periscope_machines::Issuer;
 
 use crate::{
     refusal::Refusal,
+    request::{Request, Versions},
     schema::{LeafRange, Node, Schema},
 };
-
-/// Tree versions the digests of one session must all be read from.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct Versions {
-    /// Version of the local tree.
-    pub local: u64,
-    /// Version of the remote tree.
-    pub remote: u64,
-}
-
-/// A request for the child digests of one node, on both trees.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct Request {
-    session: u64,
-    node: Node,
-}
-
-impl Request {
-    /// Rebuild a request that crossed a wire. A forged request is refused by
-    /// [`Survey::answer`] unless it names a node that is in flight.
-    #[must_use]
-    pub const fn new(session: u64, node: Node) -> Self {
-        Self { session, node }
-    }
-
-    /// Session the request belongs to: a scoped id, the issuing survey's
-    /// scope in the top 16 bits and its session count (from one) below.
-    #[must_use]
-    pub const fn session(&self) -> u64 {
-        self.session
-    }
-
-    /// The scope of the survey that issued the request's session.
-    #[must_use]
-    pub const fn scope(&self) -> u16 {
-        scope_of(self.session)
-    }
-
-    /// Node whose children are wanted.
-    #[must_use]
-    pub const fn node(&self) -> Node {
-        self.node
-    }
-}
 
 /// Outcome of a successful [`Survey::begin`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -91,10 +48,25 @@ enum State {
     Expanded(u64),
 }
 
+/// The session a survey has open, with everything it pinned.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Open {
+    session: u64,
+    schema: Schema,
+    versions: Versions,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct Slot {
     node: Node,
     state: State,
+}
+
+/// The entry a diverged session starts from, borrowed before `begin` changes
+/// anything.
+enum Start<'a> {
+    Range(&'a mut LeafRange),
+    Root(&'a mut Slot),
 }
 
 const FREE: Slot = Slot {
@@ -109,8 +81,8 @@ const EMPTY: LeafRange = LeafRange { start: 0, end: 0 };
 /// `O` bounds the buffered leaf ranges. The survey stores no digests.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Survey<const P: usize, const O: usize> {
-    schema: Option<Schema>,
-    versions: Versions,
+    /// The open session; `None` while idle.
+    open: Option<Open>,
     /// Issues session ids; the latest one is the open (or last) session.
     issuer: Issuer,
     slots: [Slot; P],
@@ -147,8 +119,9 @@ impl<const P: usize, const O: usize> Survey<P, O> {
     /// Only the session sequence is restored. No session is open and nothing
     /// is queued or buffered: every request issued before the restart is
     /// [`Refusal::Stale`], and comparing again is the caller's job.
-    /// [`session`](Self::session) names the last session issued before the
-    /// restart, which is not open. The next session carries sequence
+    /// [`session`](Self::session) answers the last session issued before the
+    /// restart, which is not open (`None` when `issued` is zero: nothing was
+    /// ever begun in this scope). The next session carries sequence
     /// `issued + 1`, so none is reissued as long as the saved count is not
     /// lower than what the survey had really issued; save it before sending a
     /// request out.
@@ -165,11 +138,7 @@ impl<const P: usize, const O: usize> Survey<P, O> {
 
     const fn build(issuer: Issuer) -> Self {
         Self {
-            schema: None,
-            versions: Versions {
-                local: 0,
-                remote: 0,
-            },
+            open: None,
             issuer,
             slots: [FREE; P],
             out: [EMPTY; O],
@@ -195,27 +164,44 @@ impl<const P: usize, const O: usize> Survey<P, O> {
             return Err(Refusal::Busy);
         }
         local.compatible(&remote).map_err(Refusal::Schema)?;
-        if O == 0 || P < usize::from(local.depth()) {
+        if P < usize::from(local.depth()) {
             return Err(Refusal::Undersized);
         }
+        // Where a diverged session starts, taken before anything changes: a
+        // single-leaf tree buffers its one range, a deeper one queues the root.
+        // A survey without room for it (`O == 0`) is undersized.
+        let start = if local.depth() == 0 {
+            Start::Range(self.out.first_mut().ok_or(Refusal::Undersized)?)
+        } else {
+            if O == 0 {
+                return Err(Refusal::Undersized);
+            }
+            Start::Root(self.slots.first_mut().ok_or(Refusal::Undersized)?)
+        };
         // Last check: a session id is only spent on a session that opens.
-        match self.issuer.issue() {
-            Ok(_) => {}
+        let session = match self.issuer.issue() {
+            Ok(session) => session,
             Err(periscope_machines::Refusal::Exhausted) => return Err(Refusal::Exhausted),
-        }
-        self.schema = Some(local);
-        self.versions = versions;
+        };
+        self.open = Some(Open {
+            session,
+            schema: local,
+            versions,
+        });
         if local_root == remote_root {
             return Ok(Begun::Identical);
         }
-        if local.depth() == 0 {
-            self.out[0] = LeafRange { start: 0, end: 1 };
-            self.buffered = 1;
-        } else {
-            self.slots[0] = Slot {
-                node: Node::ROOT,
-                state: State::Queued,
-            };
+        match start {
+            Start::Range(range) => {
+                *range = LeafRange { start: 0, end: 1 };
+                self.buffered = 1;
+            }
+            Start::Root(slot) => {
+                *slot = Slot {
+                    node: Node::ROOT,
+                    state: State::Queued,
+                };
+            }
         }
         Ok(Begun::Diverged)
     }
@@ -224,6 +210,8 @@ impl<const P: usize, const O: usize> Survey<P, O> {
     /// `None` when nothing is queued: either answers or drained output are
     /// awaited, or the survey is finished.
     pub fn next_request(&mut self) -> Option<Request> {
+        // Idle: nothing is queued, and no session to name.
+        let session = self.open?.session;
         let mut best: Option<usize> = None;
         for (i, slot) in self.slots.iter().enumerate() {
             if slot.state != State::Queued {
@@ -239,7 +227,7 @@ impl<const P: usize, const O: usize> Survey<P, O> {
         }
         let i = best?;
         self.slots[i].state = State::InFlight;
-        Some(Request::new(self.session(), self.slots[i].node))
+        Some(Request::issued(session, self.slots[i].node))
     }
 
     /// Supply both trees' child digests for an in-flight node, in child order.
@@ -256,14 +244,11 @@ impl<const P: usize, const O: usize> Survey<P, O> {
         local: &[D],
         remote: &[D],
     ) -> Result<(), Refusal> {
-        let schema = self.live(request).ok_or(Refusal::Stale)?;
-        let slot = self
-            .position(request.node, State::InFlight)
-            .ok_or(Refusal::Unexpected)?;
-        if versions != self.versions {
+        let (open, slot) = self.in_flight_slot(request)?;
+        if versions != open.versions {
             return Err(Refusal::VersionChanged);
         }
-        let fanout = usize::from(schema.fanout());
+        let fanout = usize::from(open.schema.fanout());
         if local.len() != fanout || remote.len() != fanout {
             return Err(Refusal::Arity);
         }
@@ -277,7 +262,7 @@ impl<const P: usize, const O: usize> Survey<P, O> {
             return Err(Refusal::Inconsistent);
         }
         self.slots[slot].state = State::Expanded(mask);
-        self.settle();
+        self.settle(open.schema);
         Ok(())
     }
 
@@ -288,10 +273,7 @@ impl<const P: usize, const O: usize> Survey<P, O> {
     /// another survey's scope, or no session is open; [`Refusal::Unexpected`]
     /// when the node is not in flight; the survey is unchanged.
     pub fn requeue(&mut self, request: Request) -> Result<(), Refusal> {
-        self.live(request).ok_or(Refusal::Stale)?;
-        let slot = self
-            .position(request.node, State::InFlight)
-            .ok_or(Refusal::Unexpected)?;
+        let (_, slot) = self.in_flight_slot(request)?;
         self.slots[slot].state = State::Queued;
         Ok(())
     }
@@ -321,12 +303,23 @@ impl<const P: usize, const O: usize> Survey<P, O> {
     /// how many were written; those are sorted and do not touch each other, and
     /// the rest of `out` is untouched.
     pub fn drain(&mut self, out: &mut [LeafRange]) -> usize {
-        let taken = self.buffered.min(out.len());
-        out[..taken].copy_from_slice(&self.out[..taken]);
+        let Some(live) = self.out.get(..self.buffered) else {
+            debug_assert!(false, "buffered never exceeds O");
+            return 0;
+        };
+        let mut taken = 0;
+        for (slot, range) in out.iter_mut().zip(live) {
+            *slot = *range;
+            taken += 1;
+        }
+        // taken <= buffered <= O: the live prefix was just read.
         self.out.copy_within(taken..self.buffered, 0);
         self.buffered -= taken;
-        if taken > 0 {
-            self.settle();
+        // Taking makes room; an idle survey buffers nothing and holds nothing.
+        if taken > 0
+            && let Some(open) = self.open
+        {
+            self.settle(open.schema);
         }
         taken
     }
@@ -335,10 +328,10 @@ impl<const P: usize, const O: usize> Survey<P, O> {
     /// are discarded. Never refuses: [`Aborting::AlreadyIdle`] when no session
     /// was open, which is the effect asked for already holding, and nothing changed.
     pub const fn abort(&mut self) -> Aborting {
-        if self.schema.is_none() {
+        if self.open.is_none() {
             return Aborting::AlreadyIdle;
         }
-        self.schema = None;
+        self.open = None;
         self.slots = [FREE; P];
         self.buffered = 0;
         Aborting::Aborted
@@ -347,7 +340,7 @@ impl<const P: usize, const O: usize> Survey<P, O> {
     /// Where the survey stands.
     #[must_use]
     pub fn phase(&self) -> Phase {
-        if self.schema.is_none() {
+        if self.open.is_none() {
             Phase::Idle
         } else if self.pending() > 0 {
             Phase::Surveying
@@ -358,14 +351,17 @@ impl<const P: usize, const O: usize> Survey<P, O> {
         }
     }
 
-    /// Id of the latest session; requests carry it. Zero, which is never
-    /// issued, until the first session begins.
+    /// Id of the latest session issued in this scope; its requests carry it.
+    /// `None` while no session was ever begun.
+    ///
+    /// It is the latest session, open or not: [`phase`](Self::phase) says
+    /// whether one is open. After [`abort`](Self::abort) it still answers the
+    /// aborted session, and a [`resumed`](Self::resumed) survey, idle until
+    /// its next `begin`, answers the last session issued before the restart
+    /// (`None` when it was resumed from a count of zero).
     #[must_use]
-    pub const fn session(&self) -> u64 {
-        match self.issuer.issued() {
-            0 => 0,
-            sequence => scoped(self.issuer.scope(), sequence),
-        }
+    pub const fn session(&self) -> Option<u64> {
+        self.issuer.last()
     }
 
     /// Sessions issued in this scope so far, the open one included: the count
@@ -384,16 +380,18 @@ impl<const P: usize, const O: usize> Survey<P, O> {
     /// Schema of the open session.
     #[must_use]
     pub const fn schema(&self) -> Option<Schema> {
-        self.schema
+        match self.open {
+            Some(open) => Some(open.schema),
+            None => None,
+        }
     }
 
     /// Tree versions pinned by the open session.
     #[must_use]
     pub const fn versions(&self) -> Option<Versions> {
-        if self.schema.is_some() {
-            Some(self.versions)
-        } else {
-            None
+        match self.open {
+            Some(open) => Some(open.versions),
+            None => None,
         }
     }
 
@@ -417,11 +415,21 @@ impl<const P: usize, const O: usize> Survey<P, O> {
 
     /// Origin first: a request whose session this survey's issuer never
     /// handed out names nothing here, whatever node it carries.
-    fn live(&self, request: Request) -> Option<Schema> {
-        if !self.issuer.owns(request.session) {
+    fn live(&self, request: Request) -> Option<Open> {
+        if !self.issuer.owns(request.session()) {
             return None;
         }
-        self.schema.filter(|_| request.session == self.session())
+        self.open.filter(|open| open.session == request.session())
+    }
+
+    /// The open session and the slot of the request's node, which must be in
+    /// flight: [`Refusal::Stale`] first, then [`Refusal::Unexpected`].
+    fn in_flight_slot(&self, request: Request) -> Result<(Open, usize), Refusal> {
+        let open = self.live(request).ok_or(Refusal::Stale)?;
+        let slot = self
+            .position(request.node(), State::InFlight)
+            .ok_or(Refusal::Unexpected)?;
+        Ok((open, slot))
     }
 
     fn position(&self, node: Node, state: State) -> Option<usize> {
@@ -440,8 +448,7 @@ impl<const P: usize, const O: usize> Survey<P, O> {
 
     /// Move differing children out of answered nodes for as long as the
     /// pending slots and the output buffer allow.
-    fn settle(&mut self) {
-        let Some(schema) = self.schema else { return };
+    fn settle(&mut self, schema: Schema) {
         loop {
             let mut progressed = false;
             for slot in 0..P {
@@ -472,7 +479,7 @@ impl<const P: usize, const O: usize> Survey<P, O> {
                 if !self.buffer(start, start + u64::from(run)) {
                     break;
                 }
-                mask &= !((u64::MAX >> (64 - run)) << low);
+                mask &= !((u64::MAX >> (u64::BITS - run)) << low);
             } else {
                 let child = Slot {
                     node: Node {
@@ -512,14 +519,21 @@ impl<const P: usize, const O: usize> Survey<P, O> {
     }
 
     /// Insert a run of leaves into the sorted buffer, joining touching ranges.
+    ///
+    /// `false` when it does not fit: the buffer is full and nothing changed.
+    /// Every index below is one `live` was just read at.
     fn buffer(&mut self, start: u64, end: u64) -> bool {
-        let live = &self.out[..self.buffered];
+        let Some(live) = self.out.get(..self.buffered) else {
+            debug_assert!(false, "buffered never exceeds O");
+            return false;
+        };
         let at = live
             .iter()
             .position(|r| r.start > start)
             .unwrap_or(live.len());
-        let joins_left = at > 0 && self.out[at - 1].end == start;
-        let joins_right = at < self.buffered && self.out[at].start == end;
+        let left = at.checked_sub(1).and_then(|i| live.get(i));
+        let joins_left = left.is_some_and(|r| r.end == start);
+        let joins_right = live.get(at).is_some_and(|r| r.start == end);
         match (joins_left, joins_right) {
             (true, true) => {
                 self.out[at - 1].end = self.out[at].end;

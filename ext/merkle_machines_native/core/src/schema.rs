@@ -3,19 +3,42 @@
 /// Largest supported number of children per node.
 pub const MAX_FANOUT: u8 = 64;
 
-/// Half-open range of leaf indices, `start..end`.
+/// Half-open range of leaf indices, `start..end`, never backwards.
 ///
 /// `LeafRange::default()` is the empty range `0..0`, a placeholder for
 /// pre-filling an output buffer; a survey never emits an empty range.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct LeafRange {
-    /// First leaf in the range.
-    pub start: u64,
-    /// One past the last leaf in the range.
-    pub end: u64,
+    // Crate-visible so the survey's sorted buffer can join ranges in place;
+    // it only ever widens a range, so `start <= end` holds.
+    pub(crate) start: u64,
+    pub(crate) end: u64,
 }
 
 impl LeafRange {
+    /// The leaves `start..end`, e.g. rebuilt after crossing a wire.
+    ///
+    /// `None` when `start > end`: no range runs backwards.
+    #[must_use]
+    pub const fn new(start: u64, end: u64) -> Option<Self> {
+        if start > end {
+            return None;
+        }
+        Some(Self { start, end })
+    }
+
+    /// First leaf in the range.
+    #[must_use]
+    pub const fn start(&self) -> u64 {
+        self.start
+    }
+
+    /// One past the last leaf in the range.
+    #[must_use]
+    pub const fn end(&self) -> u64 {
+        self.end
+    }
+
     /// Number of leaves covered.
     #[must_use]
     pub const fn len(&self) -> u64 {

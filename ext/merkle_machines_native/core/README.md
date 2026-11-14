@@ -38,9 +38,13 @@ bits, a sequence counted from one below, never reissued.
 `Survey::scope` and `Request::scope` read it. `answer` and `requeue` answer
 `Stale` for a request whose session the survey did not issue, before looking at
 any node. Give each survey its own scope: the core reads no clock and no random
-source, so it cannot pick one, and two surveys left in the same scope issue the
-same sessions. A scope is `Exhausted` after 2^48 - 1 sessions. `session()` is
-zero, the id no issuer hands out, until the first session begins.
+source, so it cannot pick one, and two surveys left in the same scope (two
+`new()` included) issue the same sessions and honour each other's requests. A
+scope is `Exhausted` after 2^48 - 1 sessions. `session()` is the latest session
+issued in the scope, open or not (`Issuer::last`): `None` until the first
+session begins, the aborted session after `abort`. `Request::new` rebuilds a
+request that crossed a wire and is `None` for a session of sequence zero, which
+no survey issues.
 
 **Restarts.** A fresh survey opens session one again, so a request that
 outlived a restart could name a node in flight in a new session. Save
@@ -48,11 +52,18 @@ outlived a restart could name a node in flight in a new session. Save
 each incarnation a new scope. `resumed` restores only the session sequence: the
 survey is idle, every earlier request is `Stale`, and comparing again is the
 caller's job. It is `None` when `issued` is beyond
-`periscope_machines::SEQUENCE_MAX`.
+`periscope_machines::SEQUENCE_MAX`. A resumed survey's `session()` is the last
+session issued before the restart, which is not open, or `None` when resumed
+from zero.
+
+**No clock.** The survey reads and records no time; `Versions` are tree
+versions the caller pins for one session, not instants.
 
 The Ruby gem mirrors `Schema`, `Versions`, `Node` and `Request` as `Data`
-values of the same names and fields. Where `Schema::new` answers `None`, its
-`Schema.new` raises `RangeError`. A `LeafRange` is a half-open Ruby `Range`.
+values of the same names and fields, each checked by the core when built: where
+`Schema::new` or `Request::new` answers `None`, or a field does not fit the
+core's type, `new` raises `RangeError` (`TypeError` for a wrong type). A
+`LeafRange` is a half-open Ruby `Range`.
 
 Buffered ranges are sorted, disjoint and joined when they touch. Ranges taken at
 different times may still touch each other. The traversal visits only nodes
@@ -64,7 +75,10 @@ children do is refused as inconsistent.
 `pop_range` takes one range; `drain(out)` writes as many as fit into the front
 of `out`, returns the count and leaves the rest untouched. Build the buffer as
 `[LeafRange::default(); N]`: the default is the empty range `0..0`, a
-placeholder the survey never emits.
+placeholder the survey never emits. A `LeafRange` never runs backwards: its
+fields are private, read through `start()` and `end()`, and
+`LeafRange::new(start, end)` answers `None` when `start > end`, so `len()`
+cannot underflow.
 
 ```rust
 use merkle_machines::{Begun, LeafRange, Phase, Schema, Survey, Versions};
@@ -83,7 +97,7 @@ while let Some(request) = survey.next_request() {
     let row = if node.level == 0 { 0 } else { 1 + node.index as usize };
     assert_eq!(survey.answer(request, versions, &ours[row], &theirs[row]), Ok(()));
 }
-assert_eq!(survey.pop_range(), Some(LeafRange { start: 2, end: 3 }));
+assert_eq!(survey.pop_range(), LeafRange::new(2, 3));
 assert_eq!(survey.phase(), Phase::Complete);
 
 // Another survey, another scope: it refuses a request it did not issue.
