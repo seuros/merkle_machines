@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.6.1](https://github.com/seuros/merkle_machines/compare/merkle_machines/v0.6.0...merkle_machines/v0.6.1) (2026-11-14)
+
+
+### Bug Fixes
+
+* **deps:** require matryona-machines &gt;= 0.4; Refusals table delegates Schema to Mismatches ([95b4343](https://github.com/seuros/merkle_machines/commit/95b43431d4acaf8ef35c31bc5a309f7157498396))
+
 ## [0.6.0](https://github.com/seuros/merkle_machines/compare/merkle_machines/v0.5.0...merkle_machines/v0.6.0) (2026-11-14)
 
 
