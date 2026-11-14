@@ -1,5 +1,16 @@
 # Changelog
 
+## [0.4.0](https://github.com/seuros/merkle_machines/compare/merkle_machines/v0.3.0...merkle_machines/v0.4.0) (2026-11-14)
+
+
+### ⚠ BREAKING CHANGES
+
+* seal values, check exact classes natively, clone-then-keep requests and drains, native fields helper
+
+### Features
+
+* seal values, check exact classes natively, clone-then-keep requests and drains, native fields helper ([eb6ebfa](https://github.com/seuros/merkle_machines/commit/eb6ebfa88033b8f934743af11f8b370d88d60baa))
+
 ## [0.3.0](https://github.com/seuros/merkle_machines/compare/merkle_machines/v0.2.0...merkle_machines/v0.3.0) (2026-11-13)
 
 
