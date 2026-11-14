@@ -1,6 +1,7 @@
 mod refusal;
 mod scope;
 
+use matryona_machines::testing::{XorShift64, refuses};
 use periscope_machines::{SEQUENCE_MAX, scoped, sequence_of};
 
 use super::*;
@@ -39,11 +40,10 @@ fn diverge<const P: usize, const O: usize>(survey: &mut Survey<P, O>, shape: Sch
 
 /// Both calls that take a request refuse it as stale.
 fn refuse_stale<const P: usize, const O: usize>(survey: &mut Survey<P, O>, request: Request) {
-    let stale = survey.answer(request, V, &[1, 2], &[1, 3]);
-    assert_eq!(
-        (stale, survey.requeue(request)),
-        (Err(Refusal::Stale), Err(Refusal::Stale))
-    );
+    refuses(survey, Refusal::Stale, |s| {
+        s.answer(request, V, &[1, 2], &[1, 3])
+    });
+    refuses(survey, Refusal::Stale, |s| s.requeue(request));
 }
 
 /// Naive reference tree: a node's digest is a mix of its children's digests.
@@ -80,21 +80,6 @@ impl Tree {
     }
 }
 
-struct Rng(u64);
-
-impl Rng {
-    fn next(&mut self) -> u64 {
-        self.0 ^= self.0 << 13;
-        self.0 ^= self.0 >> 7;
-        self.0 ^= self.0 << 17;
-        self.0
-    }
-
-    fn below(&mut self, bound: u64) -> u64 {
-        self.next() % bound
-    }
-}
-
 fn reply<const P: usize, const O: usize>(
     survey: &mut Survey<P, O>,
     request: Request,
@@ -118,9 +103,7 @@ fn foreign(request: Request) -> Request {
 
 /// An in-flight request from another scope is refused and changes nothing.
 fn refuse_foreign<const P: usize, const O: usize>(survey: &mut Survey<P, O>, request: Request) {
-    let frozen = *survey;
     refuse_stale(survey, foreign(request));
-    assert_eq!(*survey, frozen);
 }
 
 /// Requeue an in-flight request, then prove a repeat and a request from
@@ -128,17 +111,15 @@ fn refuse_foreign<const P: usize, const O: usize>(survey: &mut Survey<P, O>, req
 fn requeue_once<const P: usize, const O: usize>(survey: &mut Survey<P, O>, request: Request) {
     refuse_foreign(survey, request);
     assert_eq!(survey.requeue(request), Ok(()));
-    let frozen = *survey;
-    assert_eq!(survey.requeue(request), Err(Refusal::Unexpected));
+    refuses(survey, Refusal::Unexpected, |s| s.requeue(request));
     let other = must(Request::new(request.session() + 1, request.node()));
-    assert_eq!(survey.requeue(other), Err(Refusal::Stale));
-    assert_eq!(survey.requeue(foreign(request)), Err(Refusal::Stale));
-    assert_eq!(*survey, frozen);
+    refuses(survey, Refusal::Stale, |s| s.requeue(other));
+    refuses(survey, Refusal::Stale, |s| s.requeue(foreign(request)));
 }
 
 /// Drive one survey to completion under a random schedule and compare the
 /// emitted leaves with a leaf-by-leaf diff.
-fn run<const P: usize, const O: usize>(rng: &mut Rng, fanout: u8, depth: u8) {
+fn run<const P: usize, const O: usize>(rng: &mut XorShift64, fanout: u8, depth: u8) {
     let shape = schema(fanout, depth);
     let count = at(shape.leaves());
     let mut ours = Tree {
@@ -146,7 +127,7 @@ fn run<const P: usize, const O: usize>(rng: &mut Rng, fanout: u8, depth: u8) {
         leaves: [0; 256],
     };
     for leaf in &mut ours.leaves[..count] {
-        *leaf = rng.next();
+        *leaf = rng.next_u64();
     }
     let mut theirs = Tree {
         schema: shape,
@@ -161,7 +142,7 @@ fn run<const P: usize, const O: usize>(rng: &mut Rng, fanout: u8, depth: u8) {
             _ => true,
         };
         if flip {
-            *leaf ^= 1 | rng.next();
+            *leaf ^= 1 | rng.next_u64();
         }
     }
 
@@ -202,10 +183,9 @@ fn run<const P: usize, const O: usize>(rng: &mut Rng, fanout: u8, depth: u8) {
                     let frozen = survey;
                     assert_eq!(reply(&mut survey, request, &ours, &theirs), Ok(()));
                     assert_ne!(survey, frozen);
-                    let frozen = survey;
-                    let again = reply(&mut survey, request, &ours, &theirs);
-                    assert_eq!(again, Err(Refusal::Unexpected));
-                    assert_eq!(survey, frozen);
+                    refuses(&mut survey, Refusal::Unexpected, |s| {
+                        reply(s, request, &ours, &theirs)
+                    });
                 }
             }
             6 => {
@@ -246,7 +226,7 @@ fn run<const P: usize, const O: usize>(rng: &mut Rng, fanout: u8, depth: u8) {
 
 #[test]
 fn randomized_schedules_match_a_leaf_by_leaf_diff() {
-    let mut rng = Rng(0x5EED_CAFE_F00D_0001);
+    let mut rng = XorShift64::new(0x5EED_CAFE_F00D_0001);
     for _ in 0..150 {
         run::<1, 1>(&mut rng, 2, 1);
         run::<4, 1>(&mut rng, 2, 4);

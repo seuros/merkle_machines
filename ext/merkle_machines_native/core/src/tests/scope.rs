@@ -1,6 +1,7 @@
 //! Sessions are scoped ids: only the survey that issued a request honours it.
 
 use super::*;
+use matryona_machines::testing::refuses;
 
 /// Two surveys, the same calls: a request from one answered into, or requeued
 /// on, the other named a node in flight there, because both were in session 1.
@@ -18,12 +19,8 @@ fn a_request_from_another_scope_is_refused_and_changes_nothing() {
     assert_eq!((from_a.scope(), from_b.scope()), (1, 2));
     assert_eq!(from_a.node(), from_b.node());
     assert_eq!(sequence_of(from_a.session()), sequence_of(from_b.session()));
-    let (a_frozen, b_frozen) = (a, b);
-
     refuse_stale(&mut b, from_a);
-    assert_eq!(b, b_frozen);
     refuse_stale(&mut a, from_b);
-    assert_eq!(a, a_frozen);
 
     assert_eq!(a.answer(from_a, V, &[1, 2], &[1, 3]), Ok(()));
     assert_eq!(b.requeue(from_b), Ok(()));
@@ -84,14 +81,12 @@ fn a_session_of_this_scope_that_was_never_issued_is_stale() {
     let mut survey = Survey::<1, 1>::with_scope(3);
     diverge(&mut survey, schema(2, 1));
     let live = must(survey.next_request());
-    let frozen = survey;
     // Sequence zero is no id at all: there is no request to build.
     assert_eq!(Request::new(scoped(3, 0), live.node()), None);
     assert_eq!(Request::new(0, live.node()), None);
     for session in [scoped(3, 2), scoped(4, 1), 1] {
         refuse_stale(&mut survey, must(Request::new(session, live.node())));
     }
-    assert_eq!(survey, frozen);
 }
 
 #[test]
@@ -99,13 +94,10 @@ fn the_last_session_of_a_scope_is_issued_and_then_begin_is_exhausted() {
     let shape = schema(2, 1);
     let mut survey = must(Survey::<1, 1>::resumed(3, SEQUENCE_MAX - 1));
     // A call refused for another reason spends no session id.
-    let frozen = survey;
     let deep = schema(2, 5);
-    assert_eq!(
-        survey.begin(deep, deep, V, &1, &2),
-        Err(Refusal::Undersized)
-    );
-    assert_eq!(survey, frozen);
+    refuses(&mut survey, Refusal::Undersized, |s| {
+        s.begin(deep, deep, V, &1, &2)
+    });
     diverge(&mut survey, shape);
     assert_eq!(survey.session(), Some(scoped(3, SEQUENCE_MAX)));
     let last = must(survey.next_request());
@@ -116,9 +108,9 @@ fn the_last_session_of_a_scope_is_issued_and_then_begin_is_exhausted() {
     assert_eq!(survey.pop_range(), Some(range(1, 2)));
     assert_eq!(survey.phase(), Phase::Complete);
     for aborting in [Aborting::Aborted, Aborting::AlreadyIdle] {
-        let frozen = survey;
-        let exhausted = survey.begin(shape, shape, V, &1, &2);
-        assert_eq!((exhausted, survey), (Err(Refusal::Exhausted), frozen));
+        refuses(&mut survey, Refusal::Exhausted, |s| {
+            s.begin(shape, shape, V, &1, &2)
+        });
         assert_eq!(survey.abort(), aborting);
     }
     refuse_stale(&mut survey, last);
@@ -129,12 +121,9 @@ fn the_last_session_of_a_scope_is_issued_and_then_begin_is_exhausted() {
         (spent.scope(), spent.issued(), spent.phase()),
         (3, SEQUENCE_MAX, Phase::Idle)
     );
-    let frozen = spent;
-    assert_eq!(
-        spent.begin(shape, shape, V, &1, &2),
-        Err(Refusal::Exhausted)
-    );
-    assert_eq!(spent, frozen);
+    refuses(&mut spent, Refusal::Exhausted, |s| {
+        s.begin(shape, shape, V, &1, &2)
+    });
     assert_eq!(Survey::<1, 1>::resumed(3, SEQUENCE_MAX + 1), None);
     assert_eq!(Survey::<1, 1>::resumed(3, u64::MAX), None);
 }
@@ -155,11 +144,9 @@ fn a_resumed_survey_continues_its_scope_and_refuses_every_earlier_request() {
     assert_eq!((first.issued(), first.session()), (3, Some(scoped(5, 3))));
     let earlier = [aborted, identical, open];
     let refuse_earlier = |survey: &mut Survey<2, 2>| {
-        let frozen = *survey;
         for request in earlier {
             refuse_stale(survey, request);
         }
-        assert_eq!(*survey, frozen);
     };
 
     let mut survey = must(Survey::<2, 2>::resumed(first.scope(), first.issued()));

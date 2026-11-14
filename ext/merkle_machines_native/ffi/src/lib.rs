@@ -7,9 +7,9 @@ use values::{build, classes};
 use std::{cell::RefCell, cmp::Ordering};
 
 use magnus::{
-    Error, Integer, RArray, RString, Range, Ruby, Symbol, TryConvert, Value, prelude::*,
-    typed_data::Obj,
+    Error, RArray, RString, Range, Ruby, Symbol, TryConvert, Value, prelude::*, typed_data::Obj,
 };
+use matryona_machines::ruby::{exact_array, exact_fields, integer, keep, symbol};
 use merkle_machines::{
     Aborting, Begun, LeafRange, Mismatch, Node, Phase, Refusal, Request, Schema, Versions,
 };
@@ -20,41 +20,6 @@ const MAX_FANOUT: u8 = merkle_machines::MAX_FANOUT;
 
 fn type_error(value: Value, message: &'static str) -> Error {
     Error::new(Ruby::get_with(value).exception_type_error(), message)
-}
-
-fn integer(value: Value) -> Result<Value, Error> {
-    if Integer::from_value(value).is_none() {
-        return Err(type_error(value, "expected an Integer"));
-    }
-    Ok(value)
-}
-
-#[derive(Clone, Copy)]
-struct Number(u64);
-
-impl TryConvert for Number {
-    fn try_convert(value: Value) -> Result<Self, Error> {
-        u64::try_convert(integer(value)?).map(Self)
-    }
-}
-
-#[derive(Clone, Copy)]
-struct Small(u8);
-
-impl TryConvert for Small {
-    fn try_convert(value: Value) -> Result<Self, Error> {
-        u8::try_convert(integer(value)?).map(Self)
-    }
-}
-
-/// An issuer scope: an Integer in `0..=65535`.
-#[derive(Clone, Copy)]
-struct Scope(u16);
-
-impl TryConvert for Scope {
-    fn try_convert(value: Value) -> Result<Self, Error> {
-        u16::try_convert(integer(value)?).map(Self)
-    }
 }
 
 /// A caller-supplied digest: a Ruby String compared byte for byte.
@@ -75,10 +40,9 @@ impl PartialEq for Digest {
     }
 }
 
-fn digests(list: Value) -> Result<Vec<Digest>, Error> {
-    let Some(list) = RArray::from_value(list) else {
-        return Err(type_error(list, "expected an Array of String digests"));
-    };
+/// Read natively from exactly an `Array`: a subclass is a `TypeError`.
+fn digests(ruby: &Ruby, list: Value) -> Result<Vec<Digest>, Error> {
+    let list = exact_array(ruby, list, "expected an Array of String digests")?;
     list.into_iter().map(Digest::try_convert).collect()
 }
 
@@ -106,50 +70,84 @@ const fn refusal(refusal: Refusal) -> &'static str {
     }
 }
 
-type Shape = (Small, Small, Number, Number);
+/// A `MerkleMachines::Schema`, as it arrives.
+type Shape = Value;
+
+/// A schema's fields as the core's types.
+type Fields = (u8, u8, u64, u64);
+
+/// Reads every field of `shape`, exactly a `Schema`, from the struct; the
+/// core's `Schema::new` checks them after.
+fn shape_of(ruby: &Ruby, shape: Shape) -> Result<Fields, Error> {
+    let class = classes(ruby)?.schema.get(ruby);
+    let [fanout, depth, partitioning, digest] =
+        exact_fields(ruby, shape, class, "expected a MerkleMachines::Schema")?;
+    fields_of(fanout, depth, partitioning, digest)
+}
+
+fn fields_of(
+    fanout: Value,
+    depth: Value,
+    partitioning: Value,
+    digest: Value,
+) -> Result<Fields, Error> {
+    Ok((
+        integer(fanout, "fanout")?,
+        integer(depth, "depth")?,
+        integer(partitioning, "partitioning")?,
+        integer(digest, "digest")?,
+    ))
+}
 
 const INVALID_SCHEMA: &str =
     "fanout must be in 2..=MAX_FANOUT and fanout**depth must fit in 64 bits";
 
 /// The core's `Schema::new`, which Ruby's `Schema.new` answers for: a shape
 /// the core has no value for is malformed input, not a refusal.
-fn schema(ruby: &Ruby, (fanout, depth, partitioning, digest): Shape) -> Result<Schema, Error> {
-    Schema::new(fanout.0, depth.0, partitioning.0, digest.0)
+fn schema(ruby: &Ruby, (fanout, depth, partitioning, digest): Fields) -> Result<Schema, Error> {
+    Schema::new(fanout, depth, partitioning, digest)
         .ok_or_else(|| Error::new(ruby.exception_range_error(), INVALID_SCHEMA))
 }
 
 /// Raises exactly when the core cannot build this schema.
 fn check_schema(
     ruby: &Ruby,
-    fanout: Small,
-    depth: Small,
-    partitioning: Number,
-    digest: Number,
+    fanout: Value,
+    depth: Value,
+    partitioning: Value,
+    digest: Value,
 ) -> Result<(), Error> {
-    schema(ruby, (fanout, depth, partitioning, digest)).map(|_| ())
+    let shape = fields_of(fanout, depth, partitioning, digest)?;
+    schema(ruby, shape).map(drop)
 }
 
 fn schema_leaves(ruby: &Ruby, shape: Shape) -> Result<u64, Error> {
-    Ok(schema(ruby, shape)?.leaves())
+    Ok(schema(ruby, shape_of(ruby, shape)?)?.leaves())
 }
 
-fn schema_width(ruby: &Ruby, shape: Shape, level: Small) -> Result<u64, Error> {
-    Ok(schema(ruby, shape)?.width(level.0))
+fn schema_width(ruby: &Ruby, shape: Shape, level: Value) -> Result<u64, Error> {
+    let (shape, level) = (shape_of(ruby, shape)?, integer(level, "level")?);
+    Ok(schema(ruby, shape)?.width(level))
 }
 
 fn schema_span(ruby: &Ruby, shape: Shape, node: Place) -> Result<Option<Range>, Error> {
+    let (shape, node) = (shape_of(ruby, shape)?, self::node(ruby, node)?);
     schema(ruby, shape)?
-        .span(self::node(node))
+        .span(node)
         .map(|span| leaves(ruby, span))
         .transpose()
 }
 
 fn schema_compatible(ruby: &Ruby, shape: Shape, other: Shape) -> Result<Symbol, Error> {
+    let (shape, other) = (shape_of(ruby, shape)?, shape_of(ruby, other)?);
     let compatible = schema(ruby, shape)?.compatible(&schema(ruby, other)?);
-    Ok(ruby.to_symbol(match compatible {
-        Ok(()) => "compatible",
-        Err(reason) => mismatch(reason),
-    }))
+    Ok(symbol(
+        ruby,
+        match compatible {
+            Ok(()) => "compatible",
+            Err(reason) => mismatch(reason),
+        },
+    ))
 }
 
 /// A leaf range as the half-open Ruby `Range` `start...end`.
@@ -157,28 +155,54 @@ fn leaves(ruby: &Ruby, range: LeafRange) -> Result<Range, Error> {
     ruby.range_new(range.start(), range.end(), true)
 }
 
-type Place = (Small, Number);
-type Pins = (Number, Number);
-type Ticket = (Number, Small, Number);
+/// A `MerkleMachines::Node`, as it arrives.
+type Place = Value;
+/// A `MerkleMachines::Versions`, as it arrives.
+type Pins = Value;
+/// A `MerkleMachines::Request`, as it arrives.
+type Ticket = Value;
 
-const fn versions(pins: Pins) -> Versions {
-    Versions {
-        local: pins.0.0,
-        remote: pins.1.0,
-    }
+fn versions(ruby: &Ruby, pins: Pins) -> Result<Versions, Error> {
+    let class = classes(ruby)?.versions.get(ruby);
+    let [local, remote] = exact_fields(ruby, pins, class, "expected a MerkleMachines::Versions")?;
+    versions_of(local, remote)
 }
 
-const fn node(place: Place) -> Node {
-    Node {
-        level: place.0.0,
-        index: place.1.0,
-    }
+fn versions_of(local: Value, remote: Value) -> Result<Versions, Error> {
+    Ok(Versions {
+        local: integer(local, "local")?,
+        remote: integer(remote, "remote")?,
+    })
+}
+
+fn node(ruby: &Ruby, place: Place) -> Result<Node, Error> {
+    let class = classes(ruby)?.node.get(ruby);
+    let [level, index] = exact_fields(ruby, place, class, "expected a MerkleMachines::Node")?;
+    node_of(level, index)
+}
+
+fn node_of(level: Value, index: Value) -> Result<Node, Error> {
+    Ok(Node {
+        level: integer(level, "level")?,
+        index: integer(index, "index")?,
+    })
+}
+
+/// A request's session and node, read before the core is asked for it.
+fn ticket(ruby: &Ruby, ticket: Ticket) -> Result<(u64, Node), Error> {
+    let class = classes(ruby)?.request.get(ruby);
+    let [session, node] = exact_fields(ruby, ticket, class, "expected a MerkleMachines::Request")?;
+    ticket_of(ruby, session, node)
+}
+
+fn ticket_of(ruby: &Ruby, session: Value, node: Place) -> Result<(u64, Node), Error> {
+    Ok((integer(session, "session")?, self::node(ruby, node)?))
 }
 
 /// The core's `Request::new`: a session of sequence zero names no session, so
 /// no request exists for it.
-fn request(ruby: &Ruby, ticket: Ticket) -> Result<Request, Error> {
-    Request::new(ticket.0.0, node((ticket.1, ticket.2))).ok_or_else(|| {
+fn request(ruby: &Ruby, (session, node): (u64, Node)) -> Result<Request, Error> {
+    Request::new(session, node).ok_or_else(|| {
         Error::new(
             ruby.exception_range_error(),
             "session has sequence number zero, which no survey issues",
@@ -187,50 +211,29 @@ fn request(ruby: &Ruby, ticket: Ticket) -> Result<Request, Error> {
 }
 
 /// `Node.new`: every field converts to the core's type or raises.
-const fn check_node(_level: Small, _index: Number) {}
+fn check_node(level: Value, index: Value) -> Result<(), Error> {
+    node_of(level, index).map(drop)
+}
 
 /// `Versions.new`: every field converts to the core's type or raises.
-const fn check_versions(_local: Number, _remote: Number) {}
+fn check_versions(local: Value, remote: Value) -> Result<(), Error> {
+    versions_of(local, remote).map(drop)
+}
 
-/// `Request.new`: raises exactly when the core has no request for it.
-fn check_request(ruby: &Ruby, session: Number, level: Small, index: Number) -> Result<(), Error> {
-    request(ruby, (session, level, index)).map(|_| ())
+/// `Request.new`: raises exactly when the core has no request for it, or
+/// `node` is not exactly a `Node`.
+fn check_request(ruby: &Ruby, session: Value, node: Place) -> Result<(), Error> {
+    request(ruby, ticket_of(ruby, session, node)?).map(drop)
 }
 
 /// `Request#scope`: the core's `Request::scope`, so the id layout stays the
 /// core's business.
-fn request_scope(ruby: &Ruby, session: Number) -> Result<u16, Error> {
-    Ok(request(ruby, (session, Small(0), Number(0)))?.scope())
+fn request_scope(ruby: &Ruby, session: Value) -> Result<u16, Error> {
+    let root = Node { level: 0, index: 0 };
+    Ok(request(ruby, (integer(session, "session")?, root))?.scope())
 }
 
 type Core = merkle_machines::Survey<PENDING_CAPACITY, OUTPUT_CAPACITY>;
-
-/// Runs `act`, which builds a Ruby answer, on a copy of the survey and keeps
-/// the copy only once the answer exists. The receiver is checked frozen up
-/// front and again right before the store; frozen meanwhile raises
-/// `FrozenError`, changed meanwhile (a call back in while the answer was
-/// built) raises `RuntimeError`, and in both cases nothing is applied. No
-/// borrow is held while `act` runs.
-fn on_copy<R>(
-    ruby: &Ruby,
-    this: Obj<Survey>,
-    act: impl FnOnce(&mut Core) -> Result<R, Error>,
-) -> Result<R, Error> {
-    this.check_frozen()?;
-    let before = *this.core.borrow();
-    let mut after = before;
-    let answer = act(&mut after)?;
-    this.check_frozen()?;
-    let mut held = this.core.borrow_mut();
-    if *held != before {
-        return Err(Error::new(
-            ruby.exception_runtime_error(),
-            "the survey changed while the answer was built; the call was not applied",
-        ));
-    }
-    *held = after;
-    Ok(answer)
-}
 
 #[magnus::wrap(class = "MerkleMachines::Survey", free_immediately, size)]
 struct Survey {
@@ -244,14 +247,17 @@ impl Survey {
         }
     }
 
-    const fn with_scope(scope: Scope) -> Self {
-        Self {
-            core: RefCell::new(merkle_machines::Survey::with_scope(scope.0)),
-        }
+    fn with_scope(scope: Value) -> Result<Self, Error> {
+        Ok(Self {
+            core: RefCell::new(merkle_machines::Survey::with_scope(integer(
+                scope, "scope",
+            )?)),
+        })
     }
 
-    fn resumed(ruby: &Ruby, scope: Scope, issued: Number) -> Result<Self, Error> {
-        let core = merkle_machines::Survey::resumed(scope.0, issued.0).ok_or_else(|| {
+    fn resumed(ruby: &Ruby, scope: Value, issued: Value) -> Result<Self, Error> {
+        let (scope, issued) = (integer(scope, "scope")?, integer(issued, "issued")?);
+        let core = merkle_machines::Survey::resumed(scope, issued).ok_or_else(|| {
             Error::new(
                 ruby.exception_range_error(),
                 "issued is past the last sequence of a scope (2**48 - 1)",
@@ -276,39 +282,46 @@ impl Survey {
         local: Shape,
         remote: Shape,
         pins: Pins,
-        local_root: Digest,
-        remote_root: Digest,
+        local_root: Value,
+        remote_root: Value,
     ) -> Result<Symbol, Error> {
         this.check_frozen()?;
+        let (local, remote) = (shape_of(ruby, local)?, shape_of(ruby, remote)?);
+        let pins = versions(ruby, pins)?;
+        let local_root = Digest::try_convert(local_root)?;
+        let remote_root = Digest::try_convert(remote_root)?;
         let (local, remote) = (schema(ruby, local)?, schema(ruby, remote)?);
-        let begun =
-            this.core
-                .borrow_mut()
-                .begin(local, remote, versions(pins), &local_root, &remote_root);
-        Ok(ruby.to_symbol(match begun {
-            Ok(Begun::Identical) => "identical",
-            Ok(Begun::Diverged) => "diverged",
-            Err(refused) => refusal(refused),
-        }))
+        let begun = this
+            .core
+            .borrow_mut()
+            .begin(local, remote, pins, &local_root, &remote_root);
+        Ok(symbol(
+            ruby,
+            match begun {
+                Ok(Begun::Identical) => "identical",
+                Ok(Begun::Diverged) => "diverged",
+                Err(refused) => refusal(refused),
+            },
+        ))
     }
 
-    /// Decided on a copy, kept once the `Request` is built (see [`on_copy`]).
+    /// Decided on a copy, kept once the `Request` is built (see [`keep`]).
     fn next_request(ruby: &Ruby, this: Obj<Self>) -> Result<Option<Value>, Error> {
         let classes = classes(ruby)?;
-        on_copy(ruby, this, |core| {
-            let Some(request) = core.next_request() else {
+        keep(ruby, this, &this.core, Core::next_request, |request| {
+            let Some(request) = request else {
                 return Ok(None);
             };
             let Node { level, index } = request.node();
             let node = build(
-                classes.node,
+                classes.node.get(ruby),
                 [
                     ruby.integer_from_u64(level.into()).as_value(),
                     ruby.integer_from_u64(index).as_value(),
                 ],
             )?;
             let session = ruby.integer_from_u64(request.session()).as_value();
-            build(classes.request, [session, node]).map(Some)
+            build(classes.request.get(ruby), [session, node]).map(Some)
         })
     }
 
@@ -321,44 +334,54 @@ impl Survey {
         remote: Value,
     ) -> Result<Symbol, Error> {
         this.check_frozen()?;
+        let (ticket, pins) = (self::ticket(ruby, ticket)?, versions(ruby, pins)?);
         let request = request(ruby, ticket)?;
-        let (local, remote) = (digests(local)?, digests(remote)?);
+        let (local, remote) = (digests(ruby, local)?, digests(ruby, remote)?);
         let answered = this
             .core
             .borrow_mut()
-            .answer(request, versions(pins), &local, &remote);
-        Ok(ruby.to_symbol(answered.map_or_else(refusal, |()| "accepted")))
+            .answer(request, pins, &local, &remote);
+        Ok(symbol(ruby, answered.map_or_else(refusal, |()| "accepted")))
     }
 
     fn requeue(ruby: &Ruby, this: Obj<Self>, ticket: Ticket) -> Result<Symbol, Error> {
         this.check_frozen()?;
+        let ticket = self::ticket(ruby, ticket)?;
         let request = request(ruby, ticket)?;
         let requeued = this.core.borrow_mut().requeue(request);
-        Ok(ruby.to_symbol(requeued.map_or_else(refusal, |()| "requeued")))
+        Ok(symbol(ruby, requeued.map_or_else(refusal, |()| "requeued")))
     }
 
     fn pop_range(ruby: &Ruby, this: Obj<Self>) -> Result<Option<Range>, Error> {
-        on_copy(ruby, this, |core| {
-            core.pop_range()
-                .map(|range| leaves(ruby, range))
-                .transpose()
+        keep(ruby, this, &this.core, Core::pop_range, |range| {
+            range.map(|range| leaves(ruby, range)).transpose()
         })
     }
 
     /// The survey never buffers more than `OUTPUT_CAPACITY` ranges, so a
     /// larger limit takes everything and loses nothing. The ranges are read
-    /// into a buffer, then built, inside one [`on_copy`].
-    fn drain(ruby: &Ruby, this: Obj<Self>, limit: Number) -> Result<RArray, Error> {
-        let limit = usize::try_from(limit.0).map_or(OUTPUT_CAPACITY, |n| n.min(OUTPUT_CAPACITY));
-        on_copy(ruby, this, |core| {
-            let mut taken = [LeafRange::default(); OUTPUT_CAPACITY];
-            let count = core.drain(&mut taken[..limit]);
-            let ranges = ruby.ary_new_capa(count);
-            for &range in &taken[..count] {
-                ranges.push(leaves(ruby, range)?)?;
-            }
-            Ok(ranges)
-        })
+    /// into a buffer on the copy, then built, inside one [`keep`].
+    fn drain(ruby: &Ruby, this: Obj<Self>, limit: Value) -> Result<RArray, Error> {
+        this.check_frozen()?;
+        let limit: u64 = integer(limit, "limit")?;
+        let limit = usize::try_from(limit).map_or(OUTPUT_CAPACITY, |n| n.min(OUTPUT_CAPACITY));
+        keep(
+            ruby,
+            this,
+            &this.core,
+            |core| {
+                let mut taken = [LeafRange::default(); OUTPUT_CAPACITY];
+                let count = core.drain(&mut taken[..limit]);
+                (taken, count)
+            },
+            |(taken, count)| {
+                let ranges = ruby.ary_new_capa(count);
+                for &range in &taken[..count] {
+                    ranges.push(leaves(ruby, range)?)?;
+                }
+                Ok(ranges)
+            },
+        )
     }
 
     fn requeue_all(this: Obj<Self>) -> Result<usize, Error> {
@@ -369,19 +392,25 @@ impl Survey {
     fn abort(ruby: &Ruby, this: Obj<Self>) -> Result<Symbol, Error> {
         this.check_frozen()?;
         let aborting = this.core.borrow_mut().abort();
-        Ok(ruby.to_symbol(match aborting {
-            Aborting::Aborted => "aborted",
-            Aborting::AlreadyIdle => "already_idle",
-        }))
+        Ok(symbol(
+            ruby,
+            match aborting {
+                Aborting::Aborted => "aborted",
+                Aborting::AlreadyIdle => "already_idle",
+            },
+        ))
     }
 
     fn phase(ruby: &Ruby, this: &Self) -> Symbol {
-        ruby.to_symbol(match this.core.borrow().phase() {
-            Phase::Idle => "idle",
-            Phase::Surveying => "surveying",
-            Phase::Draining => "draining",
-            Phase::Complete => "complete",
-        })
+        symbol(
+            ruby,
+            match this.core.borrow().phase() {
+                Phase::Idle => "idle",
+                Phase::Surveying => "surveying",
+                Phase::Draining => "draining",
+                Phase::Complete => "complete",
+            },
+        )
     }
 
     fn session(&self) -> Option<u64> {

@@ -64,12 +64,64 @@ class ValuesTest < Minitest::Test
     assert_equal [1, 0], [survey.pending, survey.in_flight]
   end
 
+  # A singleton class opened on a genuine value does not change what it is,
+  # and the private reader still takes only the gem's classes.
+  def test_an_opened_singleton_class_is_still_the_gems_value
+    shape = Schema.new(2, 2, 1, 1).tap(&:singleton_class)
+    survey = Survey.new
+    assert_equal :diverged, survey.begin(shape, shape.clone, Versions.new(1, 1).tap(&:singleton_class), 'a', 'b')
+    request = survey.next_request.tap(&:singleton_class)
+    assert_equal :requeued, survey.requeue(request)
+    assert_equal 0...4, shape.span(Node::ROOT.clone.tap(&:singleton_class))
+    assert_equal :compatible, shape.compatible(shape)
+    assert_raises(TypeError) { shape.compatible(Struct.new(:fanout, :depth, :partitioning, :digest).new(2, 2, 1, 1)) }
+  end
+
   # A frozen survey raises FrozenError before any argument is read.
   def test_a_frozen_survey_raises_before_reading_arguments
     survey = Survey.new.freeze
     assert_raises(FrozenError) { survey.begin(nil, nil, nil, nil, nil) }
     assert_raises(FrozenError) { survey.answer(nil, nil, nil, nil) }
     assert_raises(FrozenError) { survey.requeue(nil) }
+    assert_raises(FrozenError) { survey.drain('1') }
+    assert_raises(FrozenError) { survey.begin([2, 2, 1, 1], nil, nil, 'a', 'b') }
+    assert_raises(FrozenError) { survey.answer(:ticket, nil, nil, nil) }
+    assert_raises(FrozenError) { survey.requeue(1.5) }
+  end
+
+  # Arrays are read as exactly an Array: a subclass is a TypeError.
+  def test_digests_must_be_exactly_an_array
+    shape = Schema.new(2, 2, 1, 1)
+    survey = Survey.new
+    survey.begin(shape, shape, Versions.new(1, 1), 'a', 'b')
+    request = survey.next_request
+    listed = Class.new(Array)
+    assert_raises(TypeError) { survey.answer(request, Versions.new(1, 1), listed.new(%w[a b]), %w[a c]) }
+    assert_raises(TypeError) { survey.answer(request, Versions.new(1, 1), %w[a b], listed.new(%w[a c])) }
+    assert_equal :accepted, survey.answer(request, Versions.new(1, 1), %w[a b].tap(&:singleton_class), %w[a c])
+  end
+
+  # Fields are read from the struct itself: a redefined reader, or a
+  # redefined `deconstruct`, answers nothing to the binding and never runs.
+  def test_a_redefined_reader_is_ignored
+    shape = Schema.new(2, 2, 1, 1)
+    survey = Survey.new
+    raising = -> { raise 'the binding ran a reader' }
+    readers(Schema, fanout: raising, depth: -> { 99 }, deconstruct: raising) do
+      readers(Versions, local: raising) do
+        assert_equal 4, shape.leaves
+        assert_equal 0...4, shape.span(Node::ROOT)
+        assert_equal :compatible, shape.compatible(Schema.new(2, 2, 1, 1))
+        assert_equal :diverged, survey.begin(shape, shape, Versions.new(1, 1), 'a', 'b')
+      end
+    end
+    request = survey.next_request
+    readers(Request, session: raising) do
+      readers(Node, level: -> { 7 }, index: raising) do
+        assert_equal :accepted, survey.answer(request, Versions.new(1, 1), %w[a b], %w[a c])
+        assert_equal 0...2, shape.span(Node.new(1, 0))
+      end
+    end
   end
 
   # The classes are resolved at init and pinned, so a compaction moves none
@@ -88,8 +140,22 @@ class ValuesTest < Minitest::Test
   end
 
   def test_hooks_are_private
-    %i[check_node check_versions check_request request_scope fields].each do |hook|
+    %i[check_node check_versions check_request request_scope].each do |hook|
       assert_raises(NoMethodError) { MerkleMachines.public_send(hook, 1, 1) }
+    end
+  end
+
+  private
+
+  # Runs the block with each reader of `value` redefined, then restores it.
+  def readers(value, **bodies)
+    bodies.each_key { |name| value.alias_method(:"__original_#{name}", name) }
+    bodies.each { |name, body| value.define_method(name, &body) }
+    yield
+  ensure
+    bodies.each_key do |name|
+      value.alias_method(name, :"__original_#{name}")
+      value.remove_method(:"__original_#{name}")
     end
   end
 end

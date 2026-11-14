@@ -134,7 +134,7 @@ class SurveyTest < Minitest::Test
     assert_raises(TypeError) { shape.span([0, 0]) }
     assert_raises(RangeError) { shape.span(Node.new(0, -1)) }
     assert_raises(TypeError) { shape.span(Node.new(nil, 0)) }
-    %i[schema_leaves schema_width schema_span schema_compatible fields].each do |name|
+    %i[schema_leaves schema_width schema_span schema_compatible].each do |name|
       refute_respond_to MerkleMachines, name
     end
   end

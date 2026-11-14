@@ -23,22 +23,18 @@ module MerkleMachines
     end
 
     # Total number of leaves.
-    def leaves = MerkleMachines.__send__(:schema_leaves, deconstruct)
+    def leaves = MerkleMachines.__send__(:schema_leaves, self)
 
     # Number of nodes at `level`, saturating past the leaf level.
-    def width(level) = MerkleMachines.__send__(:schema_width, deconstruct, level)
+    def width(level) = MerkleMachines.__send__(:schema_width, self, level)
 
     # Leaves below `node` as a half-open Range, nil when the node is not part
     # of the tree.
-    def span(node)
-      MerkleMachines.__send__(:schema_span, deconstruct, MerkleMachines.__send__(:fields, node, Node))
-    end
+    def span(node) = MerkleMachines.__send__(:schema_span, self, node)
 
     # :compatible, or the first field on which `other` differs:
     # :fanout_mismatch, :depth_mismatch, :partitioning_mismatch, :digest_mismatch.
-    def compatible(other)
-      MerkleMachines.__send__(:schema_compatible, deconstruct, MerkleMachines.__send__(:fields, other, Schema))
-    end
+    def compatible(other) = MerkleMachines.__send__(:schema_compatible, self, other)
   end
 
   # Tree versions every digest of one session must be read from: Integers in
@@ -56,7 +52,7 @@ module MerkleMachines
   # and raises RangeError.
   Request = Data.define(:session, :node) do
     def initialize(session:, node:)
-      MerkleMachines.__send__(:check_request, session, *MerkleMachines.__send__(:fields, node, Node))
+      MerkleMachines.__send__(:check_request, session, node)
       super
     end
 

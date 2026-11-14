@@ -1,4 +1,5 @@
 use super::*;
+use matryona_machines::testing::{refuses, unchanged};
 
 #[test]
 fn mismatched_schemas_are_refused_without_a_session() {
@@ -11,9 +12,10 @@ fn mismatched_schemas_are_refused_without_a_session() {
     ];
     let mut survey = Survey::<4, 4>::new();
     for (other, mismatch) in cases {
-        let refused = survey.begin(base, must(other), V, &1, &2);
-        assert_eq!(refused, Err(Refusal::Schema(mismatch)));
-        assert_eq!(survey, Survey::new());
+        let other = must(other);
+        refuses(&mut survey, Refusal::Schema(mismatch), |s| {
+            s.begin(base, other, V, &1, &2)
+        });
     }
     assert_eq!(
         (survey.phase(), survey.schema(), survey.versions()),
@@ -35,9 +37,9 @@ fn capacity_and_session_refusals_leave_the_survey_untouched() {
 
     let mut survey = Survey::<5, 1>::new();
     diverge(&mut survey, deep);
-    let frozen = survey;
-    assert_eq!(survey.begin(deep, deep, V, &1, &2), Err(Refusal::Busy));
-    assert_eq!(survey, frozen);
+    refuses(&mut survey, Refusal::Busy, |s| {
+        s.begin(deep, deep, V, &1, &2)
+    });
     assert_eq!(survey.abort(), Aborting::Aborted);
     assert_eq!(survey.abort(), Aborting::AlreadyIdle);
     assert_eq!(survey.phase(), Phase::Idle);
@@ -59,35 +61,26 @@ fn answers_are_checked_before_anything_moves() {
     );
     let request = must(survey.next_request());
     assert_eq!((request, survey.in_flight()), (forged, 1));
-    let frozen = survey;
     let moved = Versions {
         local: 8,
         remote: 9,
     };
     let wrong_node = must(Request::new(1, Node { level: 1, index: 0 }));
-    let refusals = [
-        (
-            survey.answer(wrong_node, V, &[1, 2], &[1, 3]),
-            Refusal::Unexpected,
-        ),
-        (
-            survey.answer(request, moved, &[1, 2], &[1, 3]),
-            Refusal::VersionChanged,
-        ),
-        (survey.answer(request, V, &[1], &[1, 3]), Refusal::Arity),
-        (
-            survey.answer(request, V, &[1, 2], &[1, 3, 4]),
-            Refusal::Arity,
-        ),
-        (
-            survey.answer(request, V, &[1, 2], &[1, 2]),
-            Refusal::Inconsistent,
-        ),
-    ];
-    for (got, want) in refusals {
-        assert_eq!(got, Err(want));
-    }
-    assert_eq!(survey, frozen);
+    refuses(&mut survey, Refusal::Unexpected, |s| {
+        s.answer(wrong_node, V, &[1, 2], &[1, 3])
+    });
+    refuses(&mut survey, Refusal::VersionChanged, |s| {
+        s.answer(request, moved, &[1, 2], &[1, 3])
+    });
+    refuses(&mut survey, Refusal::Arity, |s| {
+        s.answer(request, V, &[1], &[1, 3])
+    });
+    refuses(&mut survey, Refusal::Arity, |s| {
+        s.answer(request, V, &[1, 2], &[1, 3, 4])
+    });
+    refuses(&mut survey, Refusal::Inconsistent, |s| {
+        s.answer(request, V, &[1, 2], &[1, 2])
+    });
 
     assert_eq!(survey.answer(request, V, &[1, 2], &[1, 3]), Ok(()));
     let child = must(survey.next_request());
@@ -98,19 +91,14 @@ fn answers_are_checked_before_anything_moves() {
     let frozen = survey;
     refuse_stale(&mut survey, child);
     let fresh = must(survey.next_request());
-    let frozen_flying = survey;
     let never = must(Request::new(fresh.session(), child.node()));
-    assert_eq!(survey.requeue(never), Err(Refusal::Unexpected));
-    assert_eq!(survey, frozen_flying);
+    refuses(&mut survey, Refusal::Unexpected, |s| s.requeue(never));
     assert_eq!(survey.requeue(fresh), Ok(()));
     assert_eq!(survey, frozen);
-    assert_eq!(survey.requeue(fresh), Err(Refusal::Unexpected));
-    assert_eq!(survey, frozen);
+    refuses(&mut survey, Refusal::Unexpected, |s| s.requeue(fresh));
     assert_eq!(survey.abort(), Aborting::Aborted);
-    let idle = survey;
-    assert_eq!(survey.requeue(fresh), Err(Refusal::Stale));
-    assert_eq!(survey.abort(), Aborting::AlreadyIdle);
-    assert_eq!(survey, idle);
+    refuses(&mut survey, Refusal::Stale, |s| s.requeue(fresh));
+    assert_eq!(unchanged(&mut survey, Survey::abort), Aborting::AlreadyIdle);
 }
 
 #[test]

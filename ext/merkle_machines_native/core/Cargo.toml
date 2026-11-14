@@ -6,12 +6,15 @@ rust-version.workspace = true
 license.workspace = true
 description = "Bounded resumable digest-tree comparison that locates differing leaf ranges"
 readme = "README.md"
-exclude = ["src/**/tests.rs", "tests/"]
+exclude = ["src/**/tests.rs", "src/tests/", "tests/"]
 keywords = ["merkle", "anti-entropy", "reconciliation", "digest", "no-std"]
 categories = ["no-std", "algorithms"]
 
 [dependencies]
 periscope-machines.workspace = true
+
+[dev-dependencies]
+matryona-machines = { workspace = true, features = ["testing"] }
 
 [lints]
 workspace = true
