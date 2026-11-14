@@ -1,5 +1,16 @@
 # Changelog
 
+## [0.5.0](https://github.com/seuros/merkle_machines/compare/merkle_machines/v0.4.0...merkle_machines/v0.5.0) (2026-11-14)
+
+
+### ⚠ BREAKING CHANGES
+
+* adopt matryona-machines 0.2: native exact_fields readers for every value, native begin/answer/requeue, no reader or deconstruct runs
+
+### Features
+
+* adopt matryona-machines 0.2: native exact_fields readers for every value, native begin/answer/requeue, no reader or deconstruct runs ([b360c77](https://github.com/seuros/merkle_machines/commit/b360c775def2c804b7a4c5145cd3b7e855ff667d))
+
 ## [0.4.0](https://github.com/seuros/merkle_machines/compare/merkle_machines/v0.3.0...merkle_machines/v0.4.0) (2026-11-14)
 
 
