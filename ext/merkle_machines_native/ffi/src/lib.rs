@@ -8,7 +8,7 @@ use std::{cell::RefCell, cmp::Ordering};
 
 use magnus::{Error, RArray, RString, Range, Ruby, Symbol, Value, prelude::*, typed_data::Obj};
 use matryona_machines::ruby::{
-    Symbols, exact_array, exact_fields, exact_string, integer, keep, symbol,
+    SymbolNames, Symbols, exact_array, exact_fields, exact_string, integer, keep, symbol,
 };
 use merkle_machines::{
     Aborting, Begun, LeafRange, Mismatch, Node, Phase, Refusal, Request, Schema, Versions,
@@ -55,21 +55,26 @@ matryona_machines::symbols! {
     }
 }
 
-/// The refusal's symbol. `Schema` carries the field the schemas disagree on
-/// and leaves as that field's own symbol, so this stays a hand-written
-/// `match`: a `names_only` table gives each variant one name.
-fn refusal(refusal: Refusal) -> &'static str {
-    match refusal {
-        Refusal::Schema(reason) => Mismatches::name(reason),
-        Refusal::Undersized => "undersized",
-        Refusal::Busy => "busy",
-        Refusal::Exhausted => "exhausted",
-        Refusal::Stale => "stale",
-        Refusal::Unexpected => "unexpected",
-        Refusal::VersionChanged => "version_changed",
-        Refusal::Arity => "arity",
-        Refusal::Inconsistent => "inconsistent",
+matryona_machines::symbols! {
+    /// One symbol per `Refusal`. `Schema` carries the field the schemas
+    /// disagree on and leaves as that field's own symbol, through
+    /// `Mismatches`.
+    Refusals for Refusal as "a refusal" => names_only {
+        Schema(reason) => use Mismatches,
+        Undersized => "undersized",
+        Busy => "busy",
+        Exhausted => "exhausted",
+        Stale => "stale",
+        Unexpected => "unexpected",
+        VersionChanged => "version_changed",
+        Arity => "arity",
+        Inconsistent => "inconsistent",
     }
+}
+
+/// The refusal's symbol name.
+fn refusal(refused: Refusal) -> &'static str {
+    Refusals::name(&refused)
 }
 
 /// A `MerkleMachines::Schema`, as it arrives.
