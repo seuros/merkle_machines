@@ -1,5 +1,16 @@
 # Changelog
 
+## [0.6.0](https://github.com/seuros/merkle_machines/compare/merkle_machines/v0.5.0...merkle_machines/v0.6.0) (2026-11-14)
+
+
+### ⚠ BREAKING CHANGES
+
+* adopt matryona 0.3: digests are exactly Strings
+
+### Features
+
+* adopt matryona 0.3: digests are exactly Strings ([446543a](https://github.com/seuros/merkle_machines/commit/446543affa559cabd1e20788a8525e977d0a8e99))
+
 ## [0.5.0](https://github.com/seuros/merkle_machines/compare/merkle_machines/v0.4.0...merkle_machines/v0.5.0) (2026-11-14)
 
 
