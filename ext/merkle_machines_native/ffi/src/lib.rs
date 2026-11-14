@@ -6,10 +6,10 @@ use values::{build, classes};
 
 use std::{cell::RefCell, cmp::Ordering};
 
-use magnus::{
-    Error, RArray, RString, Range, Ruby, Symbol, TryConvert, Value, prelude::*, typed_data::Obj,
+use magnus::{Error, RArray, RString, Range, Ruby, Symbol, Value, prelude::*, typed_data::Obj};
+use matryona_machines::ruby::{
+    Symbols, exact_array, exact_fields, exact_string, integer, keep, symbol,
 };
-use matryona_machines::ruby::{exact_array, exact_fields, integer, keep, symbol};
 use merkle_machines::{
     Aborting, Begun, LeafRange, Mismatch, Node, Phase, Refusal, Request, Schema, Versions,
 };
@@ -18,19 +18,15 @@ const PENDING_CAPACITY: usize = 64;
 const OUTPUT_CAPACITY: usize = 64;
 const MAX_FANOUT: u8 = merkle_machines::MAX_FANOUT;
 
-fn type_error(value: Value, message: &'static str) -> Error {
-    Error::new(Ruby::get_with(value).exception_type_error(), message)
-}
-
 /// A caller-supplied digest: a Ruby String compared byte for byte.
 #[derive(Clone, Copy)]
 struct Digest(RString);
 
-impl TryConvert for Digest {
-    fn try_convert(value: Value) -> Result<Self, Error> {
-        RString::from_value(value)
-            .map(Self)
-            .ok_or_else(|| type_error(value, "expected a String digest"))
+impl Digest {
+    /// `value` as a digest: exactly a String, no subclass and no `to_str`;
+    /// `TypeError` `"<name> must be a String"` otherwise.
+    fn read(ruby: &Ruby, value: Value, name: &str) -> Result<Self, Error> {
+        exact_string(ruby, value, name).map(Self)
     }
 }
 
@@ -43,22 +39,28 @@ impl PartialEq for Digest {
 /// Read natively from exactly an `Array`: a subclass is a `TypeError`.
 fn digests(ruby: &Ruby, list: Value) -> Result<Vec<Digest>, Error> {
     let list = exact_array(ruby, list, "expected an Array of String digests")?;
-    list.into_iter().map(Digest::try_convert).collect()
+    list.into_iter()
+        .map(|digest| Digest::read(ruby, digest, "digest"))
+        .collect()
 }
 
-/// One symbol per `Mismatch`, shared by `Schema#compatible` and `Survey#begin`.
-const fn mismatch(mismatch: Mismatch) -> &'static str {
-    match mismatch {
-        Mismatch::Fanout => "fanout_mismatch",
-        Mismatch::Depth => "depth_mismatch",
-        Mismatch::Partitioning => "partitioning_mismatch",
-        Mismatch::Digest => "digest_mismatch",
+matryona_machines::symbols! {
+    /// One symbol per `Mismatch`, shared by `Schema#compatible` and
+    /// `Survey#begin`.
+    Mismatches for Mismatch as "a schema mismatch" {
+        Fanout => "fanout_mismatch",
+        Depth => "depth_mismatch",
+        Partitioning => "partitioning_mismatch",
+        Digest => "digest_mismatch",
     }
 }
 
-const fn refusal(refusal: Refusal) -> &'static str {
+/// The refusal's symbol. `Schema` carries the field the schemas disagree on
+/// and leaves as that field's own symbol, so this stays a hand-written
+/// `match`: a `names_only` table gives each variant one name.
+fn refusal(refusal: Refusal) -> &'static str {
     match refusal {
-        Refusal::Schema(reason) => mismatch(reason),
+        Refusal::Schema(reason) => Mismatches::name(reason),
         Refusal::Undersized => "undersized",
         Refusal::Busy => "busy",
         Refusal::Exhausted => "exhausted",
@@ -145,7 +147,7 @@ fn schema_compatible(ruby: &Ruby, shape: Shape, other: Shape) -> Result<Symbol, 
         ruby,
         match compatible {
             Ok(()) => "compatible",
-            Err(reason) => mismatch(reason),
+            Err(reason) => Mismatches::name(reason),
         },
     ))
 }
@@ -288,8 +290,8 @@ impl Survey {
         this.check_frozen()?;
         let (local, remote) = (shape_of(ruby, local)?, shape_of(ruby, remote)?);
         let pins = versions(ruby, pins)?;
-        let local_root = Digest::try_convert(local_root)?;
-        let remote_root = Digest::try_convert(remote_root)?;
+        let local_root = Digest::read(ruby, local_root, "local_root")?;
+        let remote_root = Digest::read(ruby, remote_root, "remote_root")?;
         let (local, remote) = (schema(ruby, local)?, schema(ruby, remote)?);
         let begun = this
             .core

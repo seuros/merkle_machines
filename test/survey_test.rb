@@ -339,6 +339,24 @@ class SurveyTest < Minitest::Test
     assert_equal :accepted, survey.answer(request, PINS, %w[a b], %w[a c])
   end
 
+  # A digest is exactly a String: a subclass and an object answering
+  # `to_str` are refused before the core is called.
+  def test_a_digest_is_exactly_a_string
+    subclass = Class.new(String)
+    stringly = Object.new.tap { |o| o.define_singleton_method(:to_str) { 'a' } }
+    error = assert_raises(TypeError) { Survey.new.begin(schema, schema, PINS, subclass.new('a'), 'b') }
+    assert_equal 'local_root must be a String', error.message
+    error = assert_raises(TypeError) { Survey.new.begin(schema, schema, PINS, 'a', stringly) }
+    assert_equal 'remote_root must be a String', error.message
+    survey = started
+    request = survey.next_request
+    error = assert_raises(TypeError) { survey.answer(request, PINS, ['a', subclass.new('b')], %w[a c]) }
+    assert_equal 'digest must be a String', error.message
+    assert_raises(TypeError) { survey.answer(request, PINS, %w[a b], ['a', stringly]) }
+    assert_equal [1, 1], [survey.pending, survey.in_flight]
+    assert_equal :accepted, survey.answer(request, PINS, %w[a b], ['a', 'c'.dup.tap(&:singleton_class)])
+  end
+
   # The binding never loses work: answers are built natively without running
   # Ruby code, so an `initialize` that raises cannot lose a node marked in flight.
   def test_answers_come_back_when_initialize_raises
