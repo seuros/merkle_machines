@@ -1,11 +1,11 @@
 # frozen_string_literal: true
-require 'minitest/autorun'
-require 'merkle_machines'
+require_relative 'support'
 
 # Every value is held to the core's rule, whether the gem returned it or the
 # caller built it by hand.
 class ValuesTest < Minitest::Test
   include MerkleMachines
+  include Redefining
 
   def test_node_fields_are_the_cores_types
     assert_equal [255, (2**64) - 1], Node.new(255, (2**64) - 1).deconstruct
@@ -107,8 +107,8 @@ class ValuesTest < Minitest::Test
     shape = Schema.new(2, 2, 1, 1)
     survey = Survey.new
     raising = -> { raise 'the binding ran a reader' }
-    readers(Schema, fanout: raising, depth: -> { 99 }, deconstruct: raising) do
-      readers(Versions, local: raising) do
+    redefining(Schema, fanout: raising, depth: -> { 99 }, deconstruct: raising) do
+      redefining(Versions, local: raising) do
         assert_equal 4, shape.leaves
         assert_equal 0...4, shape.span(Node::ROOT)
         assert_equal :compatible, shape.compatible(Schema.new(2, 2, 1, 1))
@@ -116,12 +116,25 @@ class ValuesTest < Minitest::Test
       end
     end
     request = survey.next_request
-    readers(Request, session: raising) do
-      readers(Node, level: -> { 7 }, index: raising) do
+    redefining(Request, session: raising) do
+      redefining(Node, level: -> { 7 }, index: raising) do
         assert_equal :accepted, survey.answer(request, Versions.new(1, 1), %w[a b], %w[a c])
         assert_equal 0...2, shape.span(Node.new(1, 0))
       end
     end
+  end
+
+  # `Request#scope` reads the request natively: a redefined reader is never
+  # called, and a session `Marshal.load` rewrote to zero is RangeError.
+  def test_scope_reads_the_request_natively
+    request = Request.new((3 << 48) | 1, Node::ROOT)
+    raising = -> { raise 'the binding ran a reader' }
+    redefining(Request, session: raising, node: raising, deconstruct: raising) do
+      assert_equal 3, request.scope
+    end
+    zero = Marshal.load(Marshal.dump(Request.new(1, Node::ROOT)).sub("i\x06".b, "i\x00".b))
+    assert_equal 0, zero.session
+    assert_raises(RangeError) { zero.scope }
   end
 
   # The classes are resolved at init and pinned, so a compaction moves none
@@ -142,20 +155,6 @@ class ValuesTest < Minitest::Test
   def test_hooks_are_private
     %i[check_node check_versions check_request request_scope].each do |hook|
       assert_raises(NoMethodError) { MerkleMachines.public_send(hook, 1, 1) }
-    end
-  end
-
-  private
-
-  # Runs the block with each reader of `value` redefined, then restores it.
-  def readers(value, **bodies)
-    bodies.each_key { |name| value.alias_method(:"__original_#{name}", name) }
-    bodies.each { |name, body| value.define_method(name, &body) }
-    yield
-  ensure
-    bodies.each_key do |name|
-      value.alias_method(name, :"__original_#{name}")
-      value.remove_method(:"__original_#{name}")
     end
   end
 end

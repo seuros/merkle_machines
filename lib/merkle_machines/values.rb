@@ -57,6 +57,7 @@ module MerkleMachines
     end
 
     # The scope of the survey that issued the request's session.
-    def scope = MerkleMachines.__send__(:request_scope, session)
+    # Read natively from the struct, never through the readers.
+    def scope = MerkleMachines.__send__(:request_scope, self)
   end
 end

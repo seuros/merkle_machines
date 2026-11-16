@@ -2,6 +2,8 @@
 
 use periscope_machines::Issuer;
 
+mod buffer;
+
 use crate::{
     refusal::Refusal,
     request::{Request, Versions},
@@ -212,22 +214,20 @@ impl<const P: usize, const O: usize> Survey<P, O> {
     pub fn next_request(&mut self) -> Option<Request> {
         // Idle: nothing is queued, and no session to name.
         let session = self.open?.session;
-        let mut best: Option<usize> = None;
-        for (i, slot) in self.slots.iter().enumerate() {
-            if slot.state != State::Queued {
-                continue;
-            }
-            let better = best.is_none_or(|b| {
-                let held = self.slots[b].node;
-                (slot.node.level, held.index) > (held.level, slot.node.index)
-            });
-            if better {
-                best = Some(i);
-            }
-        }
-        let i = best?;
-        self.slots[i].state = State::InFlight;
-        Some(Request::issued(session, self.slots[i].node))
+        // Deepest first, then leftmost; on a tie the earlier slot stays.
+        let slot = self
+            .slots
+            .iter_mut()
+            .filter(|slot| slot.state == State::Queued)
+            .reduce(|held, slot| {
+                if (slot.node.level, held.node.index) > (held.node.level, slot.node.index) {
+                    slot
+                } else {
+                    held
+                }
+            })?;
+        slot.state = State::InFlight;
+        Some(Request::issued(session, slot.node))
     }
 
     /// Supply both trees' child digests for an in-flight node, in child order.
@@ -253,6 +253,7 @@ impl<const P: usize, const O: usize> Survey<P, O> {
             return Err(Refusal::Arity);
         }
         let mut mask = 0_u64;
+        // `bit < fanout <= MAX_FANOUT == 64`, so the shift stays in range.
         for (bit, (ours, theirs)) in local.iter().zip(remote).enumerate() {
             if ours != theirs {
                 mask |= 1 << bit;
@@ -261,7 +262,7 @@ impl<const P: usize, const O: usize> Survey<P, O> {
         if mask == 0 {
             return Err(Refusal::Inconsistent);
         }
-        self.slots[slot].state = State::Expanded(mask);
+        slot.state = State::Expanded(mask);
         self.settle(open.schema);
         Ok(())
     }
@@ -274,7 +275,7 @@ impl<const P: usize, const O: usize> Survey<P, O> {
     /// when the node is not in flight; the survey is unchanged.
     pub fn requeue(&mut self, request: Request) -> Result<(), Refusal> {
         let (_, slot) = self.in_flight_slot(request)?;
-        self.slots[slot].state = State::Queued;
+        slot.state = State::Queued;
         Ok(())
     }
 
@@ -285,6 +286,7 @@ impl<const P: usize, const O: usize> Survey<P, O> {
         for slot in &mut self.slots {
             if slot.state == State::InFlight {
                 slot.state = State::Queued;
+                // At most `P` slots, so this cannot overflow.
                 moved += 1;
             }
         }
@@ -303,17 +305,18 @@ impl<const P: usize, const O: usize> Survey<P, O> {
     /// how many were written; those are sorted and do not touch each other, and
     /// the rest of `out` is untouched.
     pub fn drain(&mut self, out: &mut [LeafRange]) -> usize {
-        let Some(live) = self.out.get(..self.buffered) else {
+        let Some(live) = self.out.get_mut(..self.buffered) else {
             debug_assert!(false, "buffered never exceeds O");
             return 0;
         };
         let mut taken = 0;
-        for (slot, range) in out.iter_mut().zip(live) {
+        for (slot, range) in out.iter_mut().zip(live.iter()) {
             *slot = *range;
             taken += 1;
         }
-        // taken <= buffered <= O: the live prefix was just read.
-        self.out.copy_within(taken..self.buffered, 0);
+        // The zip bounds `taken <= live.len() == buffered`, so the shift's
+        // range is in bounds and the subtraction cannot wrap.
+        live.copy_within(taken.., 0);
         self.buffered -= taken;
         // Taking makes room; an idle survey buffers nothing and holds nothing.
         if taken > 0
@@ -398,7 +401,10 @@ impl<const P: usize, const O: usize> Survey<P, O> {
     /// Nodes held: queued, in flight or partly expanded. Never above `P`.
     #[must_use]
     pub fn pending(&self) -> usize {
-        P - self.free()
+        self.slots
+            .iter()
+            .filter(|slot| slot.state != State::Free)
+            .count()
     }
 
     /// Nodes requested and not yet answered.
@@ -424,18 +430,15 @@ impl<const P: usize, const O: usize> Survey<P, O> {
 
     /// The open session and the slot of the request's node, which must be in
     /// flight: [`Refusal::Stale`] first, then [`Refusal::Unexpected`].
-    fn in_flight_slot(&self, request: Request) -> Result<(Open, usize), Refusal> {
+    fn in_flight_slot(&mut self, request: Request) -> Result<(Open, &mut Slot), Refusal> {
         let open = self.live(request).ok_or(Refusal::Stale)?;
+        let node = request.node();
         let slot = self
-            .position(request.node(), State::InFlight)
+            .slots
+            .iter_mut()
+            .find(|slot| slot.state == State::InFlight && slot.node == node)
             .ok_or(Refusal::Unexpected)?;
         Ok((open, slot))
-    }
-
-    fn position(&self, node: Node, state: State) -> Option<usize> {
-        self.slots
-            .iter()
-            .position(|slot| slot.state == state && slot.node == node)
     }
 
     fn count(&self, state: State) -> usize {
@@ -460,20 +463,35 @@ impl<const P: usize, const O: usize> Survey<P, O> {
         }
     }
 
+    /// Overwrite the slot at `slot`. Every caller read that index with
+    /// `get` first and `P` is fixed, so the slot is always there.
+    fn put(&mut self, slot: usize, value: Slot) {
+        if let Some(held) = self.slots.get_mut(slot) {
+            *held = value;
+        }
+    }
+
     fn spill(&mut self, slot: usize, schema: Schema) -> bool {
-        let Slot {
+        let Some(&Slot {
             node,
             state: State::Expanded(mut mask),
-        } = self.slots[slot]
+        }) = self.slots.get(slot)
         else {
             return false;
         };
+        // Only nodes above the leaf level are ever queued, so an expanded
+        // node has `node.level < depth <= u8::MAX` and `node.index <
+        // fanout^level`: the child level fits a `u8`, and every child index
+        // up to `base + fanout` is at most `fanout^depth`, which `Schema::new`
+        // proved fits a `u64`.
         let level = node.level + 1;
         let base = node.index * u64::from(schema.fanout());
         let mut progressed = false;
         while mask != 0 {
             let low = mask.trailing_zeros();
             if level == schema.depth() {
+                // Bit `low` is set, so `1 <= run <= 64 - low` and the shift
+                // below is at most 63.
                 let run = (mask >> low).trailing_ones();
                 let start = base + u64::from(low);
                 if !self.buffer(start, start + u64::from(run)) {
@@ -490,67 +508,45 @@ impl<const P: usize, const O: usize> Survey<P, O> {
                 };
                 if mask.is_power_of_two() {
                     // The last child inherits its parent's slot.
-                    self.slots[slot] = child;
+                    self.put(slot, child);
                     return true;
                 }
                 // Keep enough free slots to walk one path from this child down
                 // to the leaves, so some node can always finish and free a slot.
+                // This arm has `level < depth`, so the reserve cannot wrap.
                 let reserve = usize::from(schema.depth() - 1 - level);
-                let Some(empty) = self.position(Node::ROOT, State::Free) else {
+                let free = self.free();
+                let Some(empty) = self
+                    .slots
+                    .iter_mut()
+                    .find(|slot| slot.state == State::Free && slot.node == Node::ROOT)
+                else {
                     break;
                 };
-                if self.free() - 1 < reserve {
+                // `empty` is one of the `free` slots, so after taking it
+                // `free - 1` remain: keep going only while that covers `reserve`.
+                if free <= reserve {
                     break;
                 }
-                self.slots[empty] = child;
+                *empty = child;
+                // `mask != 0` inside the loop, so this clears its lowest bit.
                 mask &= mask - 1;
             }
             progressed = true;
         }
-        self.slots[slot].state = if mask == 0 {
-            State::Free
-        } else {
-            State::Expanded(mask)
-        };
-        if mask == 0 {
-            self.slots[slot].node = Node::ROOT;
-        }
-        progressed
-    }
-
-    /// Insert a run of leaves into the sorted buffer, joining touching ranges.
-    ///
-    /// `false` when it does not fit: the buffer is full and nothing changed.
-    /// Every index below is one `live` was just read at.
-    fn buffer(&mut self, start: u64, end: u64) -> bool {
-        let Some(live) = self.out.get(..self.buffered) else {
-            debug_assert!(false, "buffered never exceeds O");
-            return false;
-        };
-        let at = live
-            .iter()
-            .position(|r| r.start > start)
-            .unwrap_or(live.len());
-        let left = at.checked_sub(1).and_then(|i| live.get(i));
-        let joins_left = left.is_some_and(|r| r.end == start);
-        let joins_right = live.get(at).is_some_and(|r| r.start == end);
-        match (joins_left, joins_right) {
-            (true, true) => {
-                self.out[at - 1].end = self.out[at].end;
-                self.out.copy_within(at + 1..self.buffered, at);
-                self.buffered -= 1;
-            }
-            (true, false) => self.out[at - 1].end = end,
-            (false, true) => self.out[at].start = start,
-            (false, false) => {
-                if self.buffered == O {
-                    return false;
+        // The parent's own slot is never the free one taken above (it is
+        // expanded), so it still holds `node`.
+        self.put(
+            slot,
+            if mask == 0 {
+                FREE
+            } else {
+                Slot {
+                    node,
+                    state: State::Expanded(mask),
                 }
-                self.out.copy_within(at..self.buffered, at + 1);
-                self.out[at] = LeafRange { start, end };
-                self.buffered += 1;
-            }
-        }
-        true
+            },
+        );
+        progressed
     }
 }

@@ -42,6 +42,7 @@ impl LeafRange {
     /// Number of leaves covered.
     #[must_use]
     pub const fn len(&self) -> u64 {
+        // Every constructor keeps `start <= end`, so this cannot wrap.
         self.end - self.start
     }
 
@@ -160,6 +161,9 @@ impl Schema {
         if node.level > self.depth || node.index >= self.width(node.level) {
             return None;
         }
+        // `node.level <= depth` and `node.index < fanout^level`, so `(index +
+        // 1) * fanout^(depth - level) <= fanout^depth`, which `new` proved
+        // fits a `u64`: nothing here can wrap.
         let each = self.width(self.depth - node.level);
         Some(LeafRange {
             start: node.index * each,

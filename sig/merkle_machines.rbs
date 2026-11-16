@@ -14,6 +14,19 @@ module MerkleMachines
   type requeue_refusal = :stale | :unexpected
   type refusal = begin_refusal | answer_refusal | requeue_refusal
 
+  # Native hooks behind the value classes, private to the module. Each
+  # raises (TypeError/RangeError) exactly when the core has no value for its
+  # arguments; the check_* hooks answer nil otherwise.
+  private def self.check_schema: (Integer fanout, Integer depth, Integer partitioning, Integer digest) -> nil
+  private def self.check_node: (Integer level, Integer index) -> nil
+  private def self.check_versions: (Integer local, Integer remote) -> nil
+  private def self.check_request: (Integer session, Node node) -> nil
+  private def self.schema_leaves: (Schema shape) -> Integer
+  private def self.schema_width: (Schema shape, Integer level) -> Integer
+  private def self.schema_span: (Schema shape, Node node) -> Range[Integer]?
+  private def self.schema_compatible: (Schema shape, Schema other) -> (:compatible | mismatch)
+  private def self.request_scope: (Request request) -> Integer
+
   # Mirrors the core's `Schema`. Like `Schema::new`, `new` has no value for a
   # `fanout` outside 2..MAX_FANOUT or a tree with more leaves than fit in 64
   # bits: it raises RangeError (TypeError for a non-Integer).
@@ -117,5 +130,13 @@ module MerkleMachines
     def pending: () -> Integer
     def in_flight: () -> Integer
     def buffered: () -> Integer
+
+    private
+
+    # The open session's schema fields (fanout, depth, partitioning, digest),
+    # nil when idle.
+    def native_schema: () -> [Integer, Integer, Integer, Integer]?
+    # The open session's pinned (local, remote) versions, nil when idle.
+    def native_versions: () -> [Integer, Integer]?
   end
 end

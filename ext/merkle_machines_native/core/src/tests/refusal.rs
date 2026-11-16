@@ -1,5 +1,5 @@
 use super::*;
-use matryona_machines::testing::{refuses, unchanged};
+use matryona_machines::testing::{describes, refuses, unchanged};
 
 #[test]
 fn mismatched_schemas_are_refused_without_a_session() {
@@ -103,15 +103,42 @@ fn answers_are_checked_before_anything_moves() {
 
 #[test]
 fn refusals_describe_themselves() {
-    extern crate alloc;
-    use alloc::string::ToString;
-    let error: &dyn core::error::Error = &Refusal::Stale;
-    assert_eq!(
-        error.to_string(),
-        "request does not belong to the open session"
-    );
-    assert_ne!(
-        Refusal::Schema(Mismatch::Fanout).to_string(),
-        Refusal::Schema(Mismatch::Depth).to_string()
-    );
+    describes(&[
+        (
+            Refusal::Schema(Mismatch::Fanout),
+            "the trees differ in fanout",
+        ),
+        (
+            Refusal::Schema(Mismatch::Depth),
+            "the trees differ in depth",
+        ),
+        (
+            Refusal::Schema(Mismatch::Partitioning),
+            "the trees differ in partitioning",
+        ),
+        (
+            Refusal::Schema(Mismatch::Digest),
+            "the trees differ in digest",
+        ),
+        (Refusal::Undersized, "capacity is below what the tree needs"),
+        (Refusal::Busy, "a session is still open"),
+        (
+            Refusal::Exhausted,
+            "every session of this scope has been issued",
+        ),
+        (
+            Refusal::Stale,
+            "request does not belong to the open session",
+        ),
+        (Refusal::Unexpected, "node is not in flight"),
+        (
+            Refusal::VersionChanged,
+            "digests were read from another tree version",
+        ),
+        (
+            Refusal::Arity,
+            "child digest list does not match the fanout",
+        ),
+        (Refusal::Inconsistent, "parents differ but no child does"),
+    ]);
 }

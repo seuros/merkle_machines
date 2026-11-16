@@ -1,9 +1,9 @@
 # frozen_string_literal: true
-require 'minitest/autorun'
-require 'merkle_machines'
+require_relative 'support'
 
 class SurveyTest < Minitest::Test
   include MerkleMachines
+  include Redefining
 
   PINS = Versions.new(local: 40, remote: 57)
 
@@ -361,17 +361,9 @@ class SurveyTest < Minitest::Test
   # Ruby code, so an `initialize` that raises cannot lose a node marked in flight.
   def test_answers_come_back_when_initialize_raises
     survey = started
-    overridden = [Request, Node].each do |type|
-      type.alias_method(:checked_initialize, :initialize)
-      type.define_method(:initialize) { |**| raise 'initialize must not run' }
-    end
-    begin
-      request = survey.next_request
-    ensure
-      overridden.each do |type|
-        type.alias_method(:initialize, :checked_initialize)
-        type.remove_method(:checked_initialize)
-      end
+    raising = proc { |**| raise 'initialize must not run' }
+    request = redefining(Request, initialize: raising) do
+      redefining(Node, initialize: raising) { survey.next_request }
     end
     assert_equal [1, 1], [survey.pending, survey.in_flight]
     assert_equal Request.new(1, Node::ROOT), request

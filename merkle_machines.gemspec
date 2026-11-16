@@ -6,8 +6,9 @@ Gem::Specification.new do |spec|
   spec.version = MerkleMachines::VERSION
   spec.authors = ['Abdelkader Boudih']
   spec.email = ['oss@seuros.com']
-  spec.summary = 'Initial bounded digest-tree comparison with a native Rust core'
-  spec.description = 'Unstable local survey of differing leaf ranges between two digest trees; no hashing or transport.'
+  spec.summary = 'Bounded digest-tree comparison for Ruby'
+  spec.description = 'Walks two digest trees of the same shape and reports the leaf ranges that differ, in ' \
+                     'fixed memory and resumable steps. Computes no hashes and moves no data.'
   spec.homepage = 'https://github.com/seuros/merkle_machines'
   spec.license = 'MIT'
   spec.required_ruby_version = '>= 4.0.0'

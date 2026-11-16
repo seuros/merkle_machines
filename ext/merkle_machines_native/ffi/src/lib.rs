@@ -234,10 +234,10 @@ fn check_request(ruby: &Ruby, session: Value, node: Place) -> Result<(), Error> 
 }
 
 /// `Request#scope`: the core's `Request::scope`, so the id layout stays the
-/// core's business.
-fn request_scope(ruby: &Ruby, session: Value) -> Result<u16, Error> {
-    let root = Node { level: 0, index: 0 };
-    Ok(request(ruby, (integer(session, "session")?, root))?.scope())
+/// core's business. The request is read natively, exactly a `Request` with
+/// its fields from the struct and checked again, never through a reader.
+fn request_scope(ruby: &Ruby, value: Ticket) -> Result<u16, Error> {
+    Ok(request(ruby, ticket(ruby, value)?)?.scope())
 }
 
 type Core = merkle_machines::Survey<PENDING_CAPACITY, OUTPUT_CAPACITY>;
