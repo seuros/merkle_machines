@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.7.1](https://github.com/seuros/merkle_machines/compare/merkle-machines-v0.7.0...merkle-machines-v0.7.1) (2026-11-16)
+
+
+### Bug Fixes
+
+* index-free merkle survey core; Request#scope reads natively ([5e40549](https://github.com/seuros/merkle_machines/commit/5e40549c8b2bf82827a563797aa3551863da6b66))
+
 ## [0.7.0](https://github.com/seuros/merkle_machines/compare/merkle-machines-v0.6.0...merkle-machines-v0.7.0) (2026-11-14)
 
 
