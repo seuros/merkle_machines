@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.6.3](https://github.com/seuros/merkle_machines/compare/merkle_machines/v0.6.2...merkle_machines/v0.6.3) (2026-11-16)
+
+
+### Bug Fixes
+
+* fix wrapped classes at load so building a value runs no Ruby ([8dc7509](https://github.com/seuros/merkle_machines/commit/8dc7509be962e5a4ab0042cf38b5ff0b5cc6f4e5))
+
 ## [0.6.2](https://github.com/seuros/merkle_machines/compare/merkle_machines/v0.6.1...merkle_machines/v0.6.2) (2026-11-16)
 
 
