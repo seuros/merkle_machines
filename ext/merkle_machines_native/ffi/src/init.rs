@@ -4,6 +4,7 @@ use crate::{
     check_versions, request_scope, schema_compatible, schema_leaves, schema_span, schema_width,
 };
 use magnus::{Error, Ruby, function, method, prelude::*};
+use matryona_machines::ruby::Class;
 
 #[magnus::init]
 fn init(ruby: &Ruby) -> Result<(), Error> {
@@ -43,5 +44,7 @@ fn init(ruby: &Ruby) -> Result<(), Error> {
     class.define_method("pending", method!(Survey::pending, 0))?;
     class.define_method("in_flight", method!(Survey::in_flight, 0))?;
     class.define_method("buffered", method!(Survey::buffered, 0))?;
-    Ok(())
+    // `new`, `with_scope` and `resumed` answer a Survey: its class is fixed
+    // now, so no conversion runs `Object.const_get` later.
+    Class::pin_wrapped::<Survey>(ruby, class).map(drop)
 }
